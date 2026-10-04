@@ -111,6 +111,9 @@ static bool Cfg_KeepBoard() {
 static bool Cfg_RollSound() {
     return CVarGetInteger(CVAR_SKATE("RollingSound"), 1) != 0;
 }
+static bool Cfg_WaterSkate() {
+    return CVarGetInteger(CVAR_SKATE("WaterSkating"), 1) != 0;
+}
 // Safety valve in case a shield model is oriented differently than expected: cycles how it's laid flat
 static s32 Cfg_BoardOrientation() {
     return CVarGetInteger(CVAR_SKATE("BoardOrientation"), 0);
@@ -270,6 +273,7 @@ struct SkateState {
     bool charging = false;
     f32 lastRise = 0.0f;    // slope along the travel direction on the last grounded frame
     f32 impactSpeed = 0.0f; // speed going into this frame, before walls slowed us down
+    bool onWater = false;   // riding on top of a water surface
     bool ollied = false;
     s16 landTimer = 0;
 
@@ -323,7 +327,7 @@ static s32 RawStickX(Input* input) {
 }
 
 static f32 StickX(Input* input) {
-    return std::clamp(RawStickX(input) / 60.0f, -1.0f, 1.0f);
+    return std::clamp(static_cast<f32>(RawStickX(input)) / 60.0f, -1.0f, 1.0f);
 }
 
 static f32 StickY(Input* input) {
@@ -369,6 +373,25 @@ static f32 FloorAt(PlayState* play, f32 x, f32 y, f32 z) {
     CollisionPoly* poly;
     s32 bgId;
     return BgCheck_EntityRaycastFloor3(&play->colCtx, &poly, &bgId, &pos);
+}
+
+// Water surface under Link, if there is water above the floor here
+static bool GetWaterSurface(PlayState* play, Player* player, f32* outY) {
+    f32 y = player->actor.world.pos.y;
+    WaterBox* waterBox;
+    if (WaterBox_GetSurface1(play, &play->colCtx, player->actor.world.pos.x, player->actor.world.pos.z, &y,
+                             &waterBox) &&
+        y > player->actor.floorHeight + 1.0f) {
+        *outY = y;
+        return true;
+    }
+    return false;
+}
+
+static void SpawnSplash(PlayState* play, Player* player, s16 size) {
+    Vec3f pos = player->actor.world.pos;
+    EffectSsGSplash_Spawn(play, &pos, NULL, NULL, 0, size);
+    EffectSsGRipple_Spawn(play, &pos, 150, 500, 0);
 }
 
 // Something is grindable when there is floor right under the board, but it drops away on at least one side
@@ -705,6 +728,10 @@ static void UpdateGround(PlayState* play, Player* player, Input* input) {
     if (player->actor.bgCheckFlags & BGCHECKFLAG_GROUND) {
         sSkate.lastRise = rise;
     }
+    if (sSkate.onWater) {
+        sSkate.lastRise = 0.0f;
+        Math_StepToF(&sSkate.speed, 0.0f, 0.02f); // water drags a little more than pavement
+    }
     sSkate.speed += slopeAlong * Tune::kSlopeAccel;
 
     // Steering: tighter at low speed
@@ -739,7 +766,7 @@ static void UpdateGround(PlayState* play, Player* player, Input* input) {
         sSkate.chargeFrames = 0;
         sSkate.ollied = true;
         StartAir(player, vy + std::max(0.0f, rise) * sSkate.speed * Tune::kRampLaunch);
-        PlaySfx(player, NA_SE_IT_SHIELD_BOUND);
+        PlaySfx(player, sSkate.onWater ? NA_SE_PL_JUMP_WATER1 : NA_SE_IT_SHIELD_BOUND);
         SetAnim(play, player, ANIM_AIR_UP);
         return;
     }
@@ -780,7 +807,19 @@ static void UpdateGround(PlayState* play, Player* player, Input* input) {
         }
     }
 
-    if (Cfg_RollSound() && sSkate.speed > 1.5f) {
+    if (sSkate.onWater) {
+        // Wake behind the board
+        if (sSkate.speed > 1.0f && (play->gameplayFrames % 3) == 0) {
+            Vec3f wake = player->actor.world.pos;
+            wake.x -= Math_SinS(sSkate.moveYaw) * 10.0f;
+            wake.z -= Math_CosS(sSkate.moveYaw) * 10.0f;
+            EffectSsGRipple_Spawn(play, &wake, 80, (s16)(250 + sSkate.speed * 20.0f), 0);
+        }
+        if (Cfg_RollSound() && sSkate.speed > 1.0f) {
+            PlayLoopSfx(player, NA_SE_PL_SLIP_WATER1_LEVEL, 0.8f + sSkate.speed * 0.03f,
+                        std::min(0.3f + sSkate.speed * 0.05f, 0.9f));
+        }
+    } else if (Cfg_RollSound() && sSkate.speed > 1.5f) {
         PlayLoopSfx(player, NA_SE_PL_SLIP_LEVEL, 0.7f + sSkate.speed * 0.03f,
                     std::min(0.25f + sSkate.speed * 0.04f, 0.8f));
     }
@@ -824,7 +863,12 @@ static void Land(PlayState* play, Player* player) {
     sSkate.landTimer = 4;
     // A little speed is lost on impact; bigger drops cost more.
     sSkate.speed *= std::clamp(1.0f + player->actor.velocity.y * 0.01f, 0.8f, 1.0f);
-    PlaySfx(player, NA_SE_IT_SHIELD_BOUND);
+    if (sSkate.onWater) {
+        PlaySfx(player, NA_SE_PL_LAND_WATER1);
+        SpawnSplash(play, player, (s16)(150 * AgeScale()));
+    } else {
+        PlaySfx(player, NA_SE_IT_SHIELD_BOUND);
+    }
     sSkate.anim = ANIM_NONE;
     SetAnim(play, player, ANIM_LAND);
 }
@@ -972,7 +1016,7 @@ static void UpdateGrind(PlayState* play, Player* player, Input* input) {
 
 static void UpdateVisuals(Player* player) {
     s16 stanceSign = (Cfg_Stance() == STANCE_GOOFY) ? -1 : 1;
-    s16 baseBody = sSkate.moveYaw + stanceSign * 0x4000 + (sSkate.fakie ? 0x8000 : 0);
+    s16 baseBody = (s16)(sSkate.moveYaw + stanceSign * 0x4000 + (sSkate.fakie ? 0x8000 : 0));
 
     sSkate.boardYaw = sSkate.moveYaw + (s16)sSkate.boardYawBase;
     sSkate.boardPitch = 0;
@@ -989,9 +1033,9 @@ static void UpdateVisuals(Player* player) {
             if (sSkate.flipIdx >= 0) {
                 const FlipTrick& flip = sFlipTricks[sSkate.flipIdx];
                 f32 t = 1.0f - (f32)sSkate.flipTimer / flip.frames;
-                sSkate.boardRoll = (s16)(s32)(flip.roll * t);
-                sSkate.boardPitch = (s16)(s32)(flip.pitch * t);
-                sSkate.boardYaw += (s16)(s32)(flip.yaw * t);
+                sSkate.boardRoll = (s16)(s32)(static_cast<f32>(flip.roll) * t);
+                sSkate.boardPitch = (s16)(s32)(static_cast<f32>(flip.pitch) * t);
+                sSkate.boardYaw += (s16)(s32)(static_cast<f32>(flip.yaw) * t);
                 sSkate.boardDrop = 6.0f * AgeScale() * sinf(t * kPi);
             }
             if (sSkate.grabIdx > 0) {
@@ -1067,6 +1111,24 @@ void Skate_Action(Player* player, PlayState* play) {
     bool nearFloor = (player->actor.world.pos.y - player->actor.floorHeight) < 10.0f * AgeScale() &&
                      player->actor.velocity.y <= 0.0f;
 
+    // Water skating: hold Link on top of the surface as long as he's on the board.
+    // The game makes Link swim once his feet are deep enough under the surface, so we catch him before that,
+    // including when a fast fall would carry him past the surface within the next frame.
+    sSkate.onWater = false;
+    f32 waterY;
+    if (Cfg_WaterSkate() && sSkate.phase != PHASE_GRIND && player->actor.velocity.y <= 0.0f &&
+        GetWaterSurface(play, player, &waterY)) {
+        f32 y = player->actor.world.pos.y;
+        f32 nextY = y + player->actor.velocity.y + Tune::kGravity;
+        if (y >= waterY - 30.0f && (y <= waterY + 1.0f || (sSkate.phase == PHASE_AIR && nextY <= waterY))) {
+            player->actor.world.pos.y = waterY;
+            player->actor.velocity.y = 0.0f;
+            sSkate.onWater = true;
+            grounded = true;
+            nearFloor = true;
+        }
+    }
+
     // Bleed speed if something (a wall, an actor) stopped us harder than we think
     sSkate.impactSpeed = sSkate.speed;
     f32 moved = Math_Vec3f_DistXZ(&player->actor.world.pos, &player->actor.prevPos);
@@ -1114,6 +1176,9 @@ void Skate_Action(Player* player, PlayState* play) {
         Dismount(play, player);
         return;
     }
+
+    // Gliding on water: no gravity, so Link stays exactly on the surface until he ollies
+    player->actor.gravity = (sSkate.onWater && sSkate.phase == PHASE_GROUND) ? 0.0f : Tune::kGravity;
 
     player->yaw = sSkate.moveYaw;
     player->linearVelocity = sSkate.speed;
@@ -1486,6 +1551,13 @@ static void RegisterSkateboardWidgets() {
         .CVar(CVAR_SKATE("SpeedMult"))
         .PreFunc(disabledIfOff)
         .Options(UIWidgets::FloatSliderOptions().Min(0.5f).Max(1.5f).DefaultValue(1.0f).Format("%.2fx"));
+
+    SohGui::mSohMenu->AddWidget(path, "Skate On Water", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_SKATE("WaterSkating"))
+        .PreFunc(disabledIfOff)
+        .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
+            "Ride across lakes and rivers as long as you stay on the board.\n"
+            "Step off or bail over deep water and Link falls in and swims."));
 
     SohGui::mSohMenu->AddWidget(path, "Show Trick HUD", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_SKATE("ShowHud"))
