@@ -1178,9 +1178,9 @@ static void DrawBoard(PlayState* play, Player* player) {
     Lights_Draw(lights, play->state.gfxCtx);
 
     Matrix_Translate(pos.x, pos.y, pos.z, MTXMODE_NEW);
-    Matrix_RotateY(BINANG_TO_RAD(sSkate.boardYaw), MTXMODE_APPLY);
-    Matrix_RotateX(BINANG_TO_RAD(sSkate.boardPitch), MTXMODE_APPLY);
-    Matrix_RotateZ(BINANG_TO_RAD(sSkate.boardRoll), MTXMODE_APPLY);
+    Matrix_RotateY(static_cast<f32>(BINANG_TO_RAD(sSkate.boardYaw)), MTXMODE_APPLY);
+    Matrix_RotateX(static_cast<f32>(BINANG_TO_RAD(sSkate.boardPitch)), MTXMODE_APPLY);
+    Matrix_RotateZ(static_cast<f32>(BINANG_TO_RAD(sSkate.boardRoll)), MTXMODE_APPLY);
     Matrix_Scale(width * size, thick * size, length * size, MTXMODE_APPLY);
     // Get-item models stand upright facing the camera; lay the shield flat, face up
     switch (Cfg_BoardOrientation()) {
