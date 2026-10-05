@@ -22,7 +22,8 @@
  *  A against a wall .... wall jump (in the air)       Bombs button (or Z) .... bomb hop
  *  R next to Epona ..... hold on and get towed, steer with the stick, let go to slingshot
  *
- * Extras: seamless loading zones while riding, and per-area quests (spell Z-E-L-D-A, clear gaps, big combo).
+ * Extras: seamless loading zones while riding, per-area quests (spell Z-E-L-D-A, clear gaps, big combo), and the
+ * Hyrule Skate Park in Hyrule Field (half pipe, Triforce funbox, rails, treasures to collect).
  */
 
 #include <libultraship/bridge/consolevariablebridge.h>
@@ -48,6 +49,7 @@
 #include "soh/SohGui/SohGui.hpp"
 #include "soh/Enhancements/nametag.h"
 #include "soh/util.h"
+#include "soh/ActorDB.h"
 
 namespace SohGui {
 extern std::shared_ptr<SohMenu> mSohMenu;
@@ -333,6 +335,7 @@ struct SkateState {
     f32 lastRise = 0.0f;    // slope along the travel direction on the last grounded frame
     f32 impactSpeed = 0.0f; // speed going into this frame, before walls slowed us down
     bool onWater = false;   // riding on top of a water surface
+    bool onPark = false;    // rolling on the skate park
     bool ollied = false;
     s16 landTimer = 0;
 
@@ -1002,6 +1005,900 @@ static std::string QuestHudLine(s32 scene) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Hyrule Skate Park: a custom actor with its own collision and vertex-colored geometry, placed in Hyrule Field.
+//
+// Layout (seen from above, +z is north). The deck is 1200 x 1200, raised a little above the field:
+//
+//        [ Goron funbox ]  [========= north quarter pipe =========]  [ Master Sword rail ]
+//
+//   west                            /\   <- Triforce (3 golden funboxes,                    east
+//   entry ramp                     /__\     jump the hole in the middle)                    entry ramp
+//                                 /\  /\   (bottom pieces)
+//                                /__\/__\  (hole in the middle)
+//                               [ launch ramp ]
+//
+//        [ Master Sword rail ]  [========= south quarter pipe =========]  [ Goron funbox ]
+//
+// The two quarter pipes face each other and make a half pipe. Riding up one sends you straight up ("vert"), and
+// you come back down into it. Floating above the park: the three Spiritual Stones (one over each Triforce piece),
+// a Heart Container over the north lip and the Ocarina of Time over the south lip. Collect them all.
+// ---------------------------------------------------------------------------------------------------------------------
+
+namespace Park {
+constexpr f32 kHalf = 600.0f;    // deck half size
+constexpr f32 kRampLen = 200.0f; // entry ramps on the east and west edges
+constexpr f32 kRampHalfWidth = 140.0f;
+constexpr f32 kQpHalfWidth = 350.0f; // quarter pipes span x in [-350, 350]
+constexpr f32 kQpRadius = 260.0f;
+constexpr f32 kQpAngle = 55.0f; // steepest part of the curve (degrees). Steeper would count as a wall.
+constexpr s32 kQpSegments = 6;
+constexpr f32 kQpLip = 560.0f;    // z of the lip; the platform behind it reaches the deck edge
+constexpr f32 kBoxHeight = 45.0f; // funboxes, rails and Triforce pieces: tall enough to grind as adult Link
+constexpr f32 kRailHalfWidth = 5.0f;
+constexpr f32 kTriSide = 420.0f; // side length of the whole Triforce
+} // namespace Park
+
+enum ParkGoalBits {
+    PARK_STONES = 1 << 0,
+    PARK_VERT = 1 << 1,
+    PARK_TRIGAP = 1 << 2,
+    PARK_COMBO = 1 << 3,
+    PARK_ALL = 15
+};
+
+struct ParkTreasure {
+    Vec3f local; // position relative to the park center (deck top = 0)
+    s16 gid;
+    f32 scale;
+    const char* name;
+    s32 goal; // which goal it counts toward
+};
+
+static ParkTreasure sParkTreasures[] = {
+    { { 0.0f, 0.0f, 0.0f }, GID_KOKIRI_EMERALD, 0.9f, "KOKIRI EMERALD", PARK_STONES },
+    { { 0.0f, 0.0f, 0.0f }, GID_GORON_RUBY, 0.9f, "GORON RUBY", PARK_STONES },
+    { { 0.0f, 0.0f, 0.0f }, GID_ZORA_SAPPHIRE, 0.9f, "ZORA SAPPHIRE", PARK_STONES },
+    { { 0.0f, 0.0f, 0.0f }, GID_HEART_CONTAINER, 1.2f, "HEART CONTAINER", PARK_VERT },
+    { { 0.0f, 0.0f, 0.0f }, GID_OCARINA_TIME, 1.4f, "OCARINA OF TIME", PARK_VERT },
+};
+static constexpr s32 kParkTreasureCount = 5;
+
+struct ParkState {
+    // where it is (saved in the settings)
+    bool placed = false;
+    Vec3f center = { 0.0f, 0.0f, 0.0f }; // deck top center
+    f32 groundMin = 0.0f;                // lowest terrain under the footprint (for the skirt)
+    f32 rampFootY[2] = { 0.0f, 0.0f };   // terrain height at the east / west ramp feet
+
+    // the live actor
+    DynaPolyActor* actor = nullptr;
+    s32 bgId = -1;
+    s16 actorId = -1;
+    bool respawn = false;
+
+    // automatic spot search, spread over several frames
+    bool searching = false;
+    s32 searchIdx = 0;
+    s32 searchCount = 0;
+    s32 searchCols = 0;
+    f32 bestScore = 0.0f;
+    Vec3f bestCenter = { 0.0f, 0.0f, 0.0f };
+    bool found = false;
+
+    // goals
+    bool overTriHole = false;
+    bool announced = false;
+    bool failed = false; // couldn't spawn in this visit (e.g. the area's collision budget is full)
+};
+static ParkState sPark;
+
+// Built geometry. Rebuilt only while no park actor exists, so the game never sees these move.
+static std::vector<Vec3s> sParkColVtx;
+static std::vector<CollisionPoly> sParkColPoly;
+static SurfaceType sParkSurfaces[2] = { { { 0, 2 } }, { { 0, 13 } } }; // concrete, metal (rails)
+static Vec3s sParkCamPos[3] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
+static CamData sParkCamData[1] = { { CAM_SET_NONE, 0, sParkCamPos } };
+static CollisionHeader sParkCol;
+static std::vector<Vtx> sParkVtx;
+static std::vector<Gfx> sParkGfx;
+
+static bool Cfg_Park() {
+    return CVarGetInteger(CVAR_SKATE("Park"), 1) != 0;
+}
+
+static s32 ParkDone() {
+    return CVarGetInteger(CVAR_SKATE("Park.Done"), 0);
+}
+
+static s32 ParkTreasureMask() {
+    return CVarGetInteger(CVAR_SKATE("Park.Treasures"), 0);
+}
+
+// ---- geometry builder ----------------------------------------------------------------------------------------------
+
+template <typename T> static void SetVtxPos(T& dst, f32 value) {
+    dst = static_cast<T>(value);
+}
+
+static Vec3f V3(f32 x, f32 y, f32 z) {
+    Vec3f v = { x, y, z };
+    return v;
+}
+
+static Vec3f Sub(const Vec3f& a, const Vec3f& b) {
+    return V3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+static Vec3f Cross(const Vec3f& a, const Vec3f& b) {
+    return V3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+static f32 Dot(const Vec3f& a, const Vec3f& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+struct ParkColor {
+    u8 r, g, b;
+};
+
+// One triangle. `out` points away from the solid, so the collision faces the right way.
+static void ParkTri(Vec3f a, Vec3f b, Vec3f c, ParkColor color, Vec3f out, bool collide = true, s32 surface = 0) {
+    Vec3f n = Cross(Sub(b, a), Sub(c, a));
+    if (Dot(n, out) < 0.0f) {
+        Vec3f t = b;
+        b = c;
+        c = t;
+        n = V3(-n.x, -n.y, -n.z);
+    }
+    f32 len = sqrtf(Dot(n, n));
+    if (len < 0.001f) {
+        return;
+    }
+    n = V3(n.x / len, n.y / len, n.z / len);
+
+    if (collide) {
+        // Corners are shared between faces to keep the vertex count low (the engine has a fixed budget)
+        u16 idx[3];
+        const Vec3f* corners[3] = { &a, &b, &c };
+        for (s32 k = 0; k < 3; k++) {
+            Vec3s s = { (s16)lroundf(corners[k]->x), (s16)lroundf(corners[k]->y), (s16)lroundf(corners[k]->z) };
+            size_t found = sParkColVtx.size();
+            for (size_t j = 0; j < sParkColVtx.size(); j++) {
+                if (sParkColVtx[j].x == s.x && sParkColVtx[j].y == s.y && sParkColVtx[j].z == s.z) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found == sParkColVtx.size()) {
+                sParkColVtx.push_back(s);
+            }
+            idx[k] = (u16)found;
+        }
+        CollisionPoly poly;
+        memset(&poly, 0, sizeof(poly));
+        poly.type = (u16)surface;
+        poly.flags_vIA = idx[0];
+        poly.flags_vIB = idx[1];
+        poly.vIC = idx[2];
+        poly.normal.x = (s16)(n.x * 32767.0f);
+        poly.normal.y = (s16)(n.y * 32767.0f);
+        poly.normal.z = (s16)(n.z * 32767.0f);
+        poly.dist = (s16)lroundf(-Dot(n, a));
+        sParkColPoly.push_back(poly);
+    }
+
+    // Simple sun shading so the shapes read clearly
+    Vec3f light = V3(0.35f, 0.85f, 0.4f);
+    f32 shade = 0.55f + 0.45f * std::max(0.0f, Dot(n, light) / sqrtf(Dot(light, light)));
+    for (const Vec3f* p : { &a, &b, &c }) {
+        Vtx v;
+        memset(&v, 0, sizeof(v));
+        SetVtxPos(v.v.ob[0], p->x);
+        SetVtxPos(v.v.ob[1], p->y);
+        SetVtxPos(v.v.ob[2], p->z);
+        v.v.cn[0] = (u8)std::min(255.0f, color.r * shade);
+        v.v.cn[1] = (u8)std::min(255.0f, color.g * shade);
+        v.v.cn[2] = (u8)std::min(255.0f, color.b * shade);
+        v.v.cn[3] = 255;
+        sParkVtx.push_back(v);
+    }
+}
+
+static void ParkQuad(Vec3f a, Vec3f b, Vec3f c, Vec3f d, ParkColor color, Vec3f out, bool collide = true,
+                     s32 surface = 0) {
+    ParkTri(a, b, c, color, out, collide, surface);
+    ParkTri(a, c, d, color, out, collide, surface);
+}
+
+// Axis-aligned box sitting on y0, top at y1 (no bottom face)
+static void ParkBox(f32 x0, f32 x1, f32 z0, f32 z1, f32 y0, f32 y1, ParkColor top, ParkColor side, s32 surface = 0) {
+    ParkQuad(V3(x0, y1, z0), V3(x1, y1, z0), V3(x1, y1, z1), V3(x0, y1, z1), top, V3(0, 1, 0), true, surface);
+    ParkQuad(V3(x0, y0, z0), V3(x1, y0, z0), V3(x1, y1, z0), V3(x0, y1, z0), side, V3(0, 0, -1), true, surface);
+    ParkQuad(V3(x0, y0, z1), V3(x1, y0, z1), V3(x1, y1, z1), V3(x0, y1, z1), side, V3(0, 0, 1), true, surface);
+    ParkQuad(V3(x0, y0, z0), V3(x0, y0, z1), V3(x0, y1, z1), V3(x0, y1, z0), side, V3(-1, 0, 0), true, surface);
+    ParkQuad(V3(x1, y0, z0), V3(x1, y0, z1), V3(x1, y1, z1), V3(x1, y1, z0), side, V3(1, 0, 0), true, surface);
+}
+
+// Ramp along z: rises from height 0 at zLow to height h at zHigh (zHigh may be smaller than zLow)
+static void ParkKickerZ(f32 x0, f32 x1, f32 zLow, f32 zHigh, f32 h, ParkColor top, ParkColor side, bool backFace) {
+    f32 dir = (zHigh > zLow) ? 1.0f : -1.0f;
+    ParkQuad(V3(x0, 0, zLow), V3(x1, 0, zLow), V3(x1, h, zHigh), V3(x0, h, zHigh), top, V3(0, 1, -dir * 0.5f));
+    ParkTri(V3(x0, 0, zLow), V3(x0, 0, zHigh), V3(x0, h, zHigh), side, V3(-1, 0, 0));
+    ParkTri(V3(x1, 0, zLow), V3(x1, 0, zHigh), V3(x1, h, zHigh), side, V3(1, 0, 0));
+    if (backFace) {
+        ParkQuad(V3(x0, 0, zHigh), V3(x1, 0, zHigh), V3(x1, h, zHigh), V3(x0, h, zHigh), side, V3(0, 0, dir));
+    }
+}
+
+// Quarter pipe across x in [-w, w]. `dir` = +1: the lip is at +kQpLip and the ramp faces south, -1: mirrored.
+static void ParkQuarterPipe(f32 dir, f32 bottom, ParkColor curve, ParkColor deck, ParkColor wall) {
+    using namespace Park;
+    f32 w = kQpHalfWidth;
+    f32 maxA = kQpAngle * kPi / 180.0f;
+    f32 zStart = kQpLip - kQpRadius * sinf(maxA);
+    f32 top = kQpRadius * (1.0f - cosf(maxA));
+
+    Vec3f profile[kQpSegments + 1]; // (unused x) z, y
+    for (s32 i = 0; i <= kQpSegments; i++) {
+        f32 a = maxA * (f32)i / (f32)kQpSegments;
+        profile[i] = V3(0.0f, kQpRadius * (1.0f - cosf(a)), dir * (zStart + kQpRadius * sinf(a)));
+    }
+    // the curve
+    for (s32 i = 0; i < kQpSegments; i++) {
+        f32 a = maxA * ((f32)i + 0.5f) / (f32)kQpSegments;
+        Vec3f out = V3(0.0f, cosf(a), -dir * sinf(a));
+        ParkQuad(V3(-w, profile[i].y, profile[i].z), V3(w, profile[i].y, profile[i].z),
+                 V3(w, profile[i + 1].y, profile[i + 1].z), V3(-w, profile[i + 1].y, profile[i + 1].z), curve, out);
+    }
+    // platform behind the lip, out to the deck edge
+    f32 lipZ = dir * kQpLip;
+    f32 edgeZ = dir * kHalf;
+    ParkQuad(V3(-w, top, lipZ), V3(w, top, lipZ), V3(w, top, edgeZ), V3(-w, top, edgeZ), deck, V3(0, 1, 0));
+    // back wall down to the ground
+    ParkQuad(V3(-w, bottom, edgeZ), V3(w, bottom, edgeZ), V3(w, top, edgeZ), V3(-w, top, edgeZ), wall, V3(0, 0, dir));
+    // side walls (fan from the bottom of the curve)
+    for (f32 sx : { -w, w }) {
+        Vec3f out = V3(sx > 0 ? 1.0f : -1.0f, 0.0f, 0.0f);
+        Vec3f corner = V3(sx, 0.0f, edgeZ);
+        for (s32 i = 0; i < kQpSegments; i++) {
+            ParkTri(corner, V3(sx, profile[i].y, profile[i].z), V3(sx, profile[i + 1].y, profile[i + 1].z), wall, out);
+        }
+        ParkTri(corner, V3(sx, profile[kQpSegments].y, profile[kQpSegments].z), V3(sx, top, edgeZ), wall, out);
+    }
+}
+
+// Triangular prism (Triforce piece) with corners a, b, c on the deck
+static void ParkPrism(Vec3f a, Vec3f b, Vec3f c, f32 h, ParkColor top, ParkColor side) {
+    Vec3f center = V3((a.x + b.x + c.x) / 3.0f, 0.0f, (a.z + b.z + c.z) / 3.0f);
+    ParkTri(V3(a.x, h, a.z), V3(b.x, h, b.z), V3(c.x, h, c.z), top, V3(0, 1, 0));
+    const Vec3f* pts[3] = { &a, &b, &c };
+    for (s32 i = 0; i < 3; i++) {
+        const Vec3f& p = *pts[i];
+        const Vec3f& q = *pts[(i + 1) % 3];
+        Vec3f mid = V3((p.x + q.x) * 0.5f, 0.0f, (p.z + q.z) * 0.5f);
+        Vec3f out = Sub(mid, center);
+        ParkQuad(V3(p.x, 0, p.z), V3(q.x, 0, q.z), V3(q.x, h, q.z), V3(p.x, h, p.z), side, out);
+    }
+}
+
+static void TriforcePoints(Vec3f* T, Vec3f* L, Vec3f* R, Vec3f* mTL, Vec3f* mTR, Vec3f* mLR) {
+    f32 h = Park::kTriSide * 0.8660254f;
+    *T = V3(0.0f, 0.0f, h * 2.0f / 3.0f);
+    *L = V3(-Park::kTriSide * 0.5f, 0.0f, -h / 3.0f);
+    *R = V3(Park::kTriSide * 0.5f, 0.0f, -h / 3.0f);
+    *mTL = V3((T->x + L->x) * 0.5f, 0.0f, (T->z + L->z) * 0.5f);
+    *mTR = V3((T->x + R->x) * 0.5f, 0.0f, (T->z + R->z) * 0.5f);
+    *mLR = V3((L->x + R->x) * 0.5f, 0.0f, (L->z + R->z) * 0.5f);
+}
+
+static bool PointInTri(f32 px, f32 pz, const Vec3f& a, const Vec3f& b, const Vec3f& c) {
+    f32 d1 = (px - b.x) * (a.z - b.z) - (a.x - b.x) * (pz - b.z);
+    f32 d2 = (px - c.x) * (b.z - c.z) - (b.x - c.x) * (pz - c.z);
+    f32 d3 = (px - a.x) * (c.z - a.z) - (c.x - a.x) * (pz - a.z);
+    bool neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    bool pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    return !(neg && pos);
+}
+
+static void BuildParkGeometry() {
+    using namespace Park;
+    sParkColVtx.clear();
+    sParkColPoly.clear();
+    sParkVtx.clear();
+    sParkGfx.clear();
+
+    const ParkColor stone = { 205, 198, 186 };
+    const ParkColor stoneDark = { 125, 115, 104 };
+    const ParkColor hylianBlue = { 55, 85, 200 };
+    const ParkColor blueDark = { 35, 50, 130 };
+    const ParkColor gold = { 245, 200, 60 };
+    const ParkColor goldDark = { 190, 140, 35 };
+    const ParkColor silver = { 215, 222, 238 };
+    const ParkColor kokiri = { 70, 175, 75 };
+    const ParkColor kokiriDark = { 40, 115, 45 };
+    const ParkColor goron = { 185, 85, 55 };
+    const ParkColor goronDark = { 125, 55, 35 };
+
+    f32 bottom = sPark.groundMin - sPark.center.y - 30.0f; // skirt reaches below the lowest terrain
+
+    // Deck
+    ParkQuad(V3(-kHalf, 0, -kHalf), V3(kHalf, 0, -kHalf), V3(kHalf, 0, kHalf), V3(-kHalf, 0, kHalf), stone,
+             V3(0, 1, 0));
+    // Skirt (outside walls of the deck). The quarter pipes' back walls cover the middle of the north/south edges.
+    for (f32 sz : { -1.0f, 1.0f }) {
+        for (f32 sx : { -1.0f, 1.0f }) {
+            f32 xa = sx * kQpHalfWidth;
+            f32 xb = sx * kHalf;
+            ParkQuad(V3(xa, bottom, sz * kHalf), V3(xb, bottom, sz * kHalf), V3(xb, 0, sz * kHalf),
+                     V3(xa, 0, sz * kHalf), stoneDark, V3(0, 0, sz));
+        }
+    }
+    for (f32 sx : { -1.0f, 1.0f }) {
+        f32 x = sx * kHalf;
+        // leave the entry ramp opening at z in [-kRampHalfWidth, kRampHalfWidth] (the ramp covers it)
+        ParkQuad(V3(x, bottom, -kHalf), V3(x, bottom, -kRampHalfWidth), V3(x, 0, -kRampHalfWidth), V3(x, 0, -kHalf),
+                 stoneDark, V3(sx, 0, 0));
+        ParkQuad(V3(x, bottom, kRampHalfWidth), V3(x, bottom, kHalf), V3(x, 0, kHalf), V3(x, 0, kRampHalfWidth),
+                 stoneDark, V3(sx, 0, 0));
+        // entry ramp down to the field
+        f32 footY = sPark.rampFootY[sx > 0 ? 0 : 1] - sPark.center.y - 4.0f;
+        f32 xOut = sx * (kHalf + kRampLen);
+        ParkQuad(V3(x, 0, -kRampHalfWidth), V3(x, 0, kRampHalfWidth), V3(xOut, footY, kRampHalfWidth),
+                 V3(xOut, footY, -kRampHalfWidth), stone, V3(0, 1, 0));
+        for (f32 sz : { -1.0f, 1.0f }) {
+            f32 z = sz * kRampHalfWidth;
+            ParkTri(V3(x, 0, z), V3(xOut, footY, z), V3(x, footY, z), stoneDark, V3(0, 0, sz));
+        }
+    }
+
+    // Half pipe: two quarter pipes facing each other
+    ParkQuarterPipe(1.0f, bottom, hylianBlue, gold, blueDark);
+    ParkQuarterPipe(-1.0f, bottom, hylianBlue, gold, blueDark);
+
+    // Triforce: three golden funboxes, with the classic hole in the middle
+    Vec3f T, L, R, mTL, mTR, mLR;
+    TriforcePoints(&T, &L, &R, &mTL, &mTR, &mLR);
+    ParkPrism(T, mTL, mTR, kBoxHeight, gold, goldDark);
+    ParkPrism(mTL, L, mLR, kBoxHeight, gold, goldDark);
+    ParkPrism(mTR, mLR, R, kBoxHeight, gold, goldDark);
+    // launch ramp up onto the two bottom pieces
+    ParkKickerZ(L.x, R.x, L.z - 150.0f, L.z, kBoxHeight, kokiri, kokiriDark, false);
+
+    // Master Sword rails (north-east and south-west) with kickers in front
+    ParkBox(470.0f - kRailHalfWidth, 470.0f + kRailHalfWidth, 190.0f, 520.0f, 0.0f, kBoxHeight, silver, silver, 1);
+    ParkKickerZ(440.0f, 500.0f, 120.0f, 175.0f, 28.0f, kokiri, kokiriDark, true);
+    ParkBox(-470.0f - kRailHalfWidth, -470.0f + kRailHalfWidth, -520.0f, -190.0f, 0.0f, kBoxHeight, silver, silver, 1);
+    ParkKickerZ(-500.0f, -440.0f, -120.0f, -175.0f, 28.0f, kokiri, kokiriDark, true);
+
+    // Goron funboxes (north-west and south-east) with a kicker on the inner end
+    ParkBox(-560.0f, -390.0f, 230.0f, 520.0f, 0.0f, kBoxHeight, goron, goronDark);
+    ParkKickerZ(-560.0f, -390.0f, 150.0f, 230.0f, kBoxHeight, kokiri, kokiriDark, false);
+    ParkBox(390.0f, 560.0f, -520.0f, -230.0f, 0.0f, kBoxHeight, goron, goronDark);
+    ParkKickerZ(390.0f, 560.0f, -150.0f, -230.0f, kBoxHeight, kokiri, kokiriDark, false);
+
+    // Treasures: a Spiritual Stone over each Triforce piece, vert treasures over the lips
+    f32 qpTop = kQpRadius * (1.0f - cosf(kQpAngle * kPi / 180.0f));
+    Vec3f pieces[3] = { V3((T.x + mTL.x + mTR.x) / 3.0f, 0, (T.z + mTL.z + mTR.z) / 3.0f),
+                        V3((mTL.x + L.x + mLR.x) / 3.0f, 0, (mTL.z + L.z + mLR.z) / 3.0f),
+                        V3((mTR.x + mLR.x + R.x) / 3.0f, 0, (mTR.z + mLR.z + R.z) / 3.0f) };
+    for (s32 i = 0; i < 3; i++) {
+        sParkTreasures[i].local = V3(pieces[i].x, kBoxHeight + 85.0f, pieces[i].z); // ollie off the piece
+    }
+    sParkTreasures[3].local = V3(0.0f, qpTop + 110.0f, kQpLip - 10.0f); // big vert air
+    sParkTreasures[4].local = V3(0.0f, qpTop + 110.0f, -kQpLip + 10.0f);
+
+    // Collision header
+    memset(&sParkCol, 0, sizeof(sParkCol));
+    Vec3s mn = { 32767, 32767, 32767 };
+    Vec3s mx = { -32767, -32767, -32767 };
+    for (const Vec3s& v : sParkColVtx) {
+        mn.x = std::min(mn.x, v.x);
+        mn.y = std::min(mn.y, v.y);
+        mn.z = std::min(mn.z, v.z);
+        mx.x = std::max(mx.x, v.x);
+        mx.y = std::max(mx.y, v.y);
+        mx.z = std::max(mx.z, v.z);
+    }
+    sParkCol.minBounds = mn;
+    sParkCol.maxBounds = mx;
+    sParkCol.numVertices = (u16)sParkColVtx.size();
+    sParkCol.vtxList = sParkColVtx.data();
+    sParkCol.numPolygons = (u16)sParkColPoly.size();
+    sParkCol.polyList = sParkColPoly.data();
+    sParkCol.surfaceTypeList = sParkSurfaces;
+    sParkCol.cameraDataList = sParkCamData;
+    sParkCol.cameraDataListLen = 1;
+    sParkCol.numWaterBoxes = 0;
+    sParkCol.waterBoxes = NULL;
+
+    // Display list: flat vertex colors, depth tested, no texture
+    u32 rm = Z_CMP | Z_UPD | CVG_DST_CLAMP | FORCE_BL | ZMODE_OPA;
+    u32 blc1 = GBL_c1(G_BL_CLR_IN, G_BL_0, G_BL_CLR_IN, G_BL_1);
+    u32 blc2 = GBL_c2(G_BL_CLR_IN, G_BL_0, G_BL_CLR_IN, G_BL_1);
+    sParkGfx.push_back(gsDPPipeSync());
+    sParkGfx.push_back(gsSPTexture(0, 0, 0, G_TX_RENDERTILE, G_OFF));
+    sParkGfx.push_back(gsDPSetCycleType(G_CYC_1CYCLE));
+    sParkGfx.push_back(gsDPSetRenderMode(rm | blc1, rm | blc2));
+    sParkGfx.push_back(gsDPSetCombineMode(G_CC_SHADE, G_CC_SHADE));
+    sParkGfx.push_back(gsSPLoadGeometryMode(G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH));
+    const size_t kChunk = 30; // 10 triangles per vertex load
+    for (size_t start = 0; start < sParkVtx.size(); start += kChunk) {
+        size_t count = std::min(kChunk, sParkVtx.size() - start);
+        sParkGfx.push_back(gsSPVertex((uintptr_t)(sParkVtx.data() + start), (u32)count, 0));
+        for (size_t t = 0; t + 2 < count; t += 3) {
+            sParkGfx.push_back(gsSP1Triangle((u8)t, (u8)(t + 1), (u8)(t + 2), 0));
+        }
+    }
+    sParkGfx.push_back(gsSPEndDisplayList());
+}
+
+// ---- the actor ------------------------------------------------------------------------------------------------------
+
+static void ParkActor_Init(Actor* thisx, PlayState* play) {
+    DynaPolyActor* dyna = (DynaPolyActor*)thisx;
+    DynaPolyActor_Init(dyna, 0);
+    Actor_SetScale(thisx, 1.0f);
+    thisx->world.rot.x = thisx->world.rot.y = thisx->world.rot.z = 0;
+    thisx->shape.rot = thisx->world.rot;
+    dyna->bgId = DynaPoly_SetBgActor(play, &play->colCtx.dyna, thisx, &sParkCol);
+    sPark.bgId = dyna->bgId;
+
+    NameTagOptions options = {};
+    options.tag = "skate_park";
+    options.yOffset = 150;
+    options.textColor = { 255, 215, 60, 255 };
+    NameTag_RegisterForActorWithOptions(thisx, "HYRULE SKATE PARK", options);
+}
+
+static void ParkActor_Destroy(Actor* thisx, PlayState* play) {
+    DynaPolyActor* dyna = (DynaPolyActor*)thisx;
+    DynaPoly_DeleteBgActor(play, &play->colCtx.dyna, dyna->bgId);
+    if (sPark.actor == dyna) {
+        sPark.actor = nullptr;
+        sPark.bgId = -1;
+    }
+}
+
+static void ParkActor_Update(Actor*, PlayState*) {
+}
+
+static void ParkActor_Draw(Actor*, PlayState* play) {
+    if (sParkGfx.empty()) {
+        return;
+    }
+    OPEN_DISPS(play->state.gfxCtx);
+    gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+    gSPDisplayList(POLY_OPA_DISP++, sParkGfx.data());
+    CLOSE_DISPS(play->state.gfxCtx);
+
+    s32 mask = ParkTreasureMask();
+    s16 spin = (s16)(play->gameplayFrames * 0x280);
+    for (s32 i = 0; i < kParkTreasureCount; i++) {
+        if (mask & (1 << i)) {
+            continue;
+        }
+        const ParkTreasure& t = sParkTreasures[i];
+        Matrix_Push();
+        Matrix_Translate(t.local.x, t.local.y + 4.0f * Math_SinS((s16)(spin * 2 + i * 0x2000)), t.local.z,
+                         MTXMODE_APPLY);
+        Matrix_RotateY(static_cast<f32>(BINANG_TO_RAD(spin)), MTXMODE_APPLY);
+        Matrix_Scale(t.scale, t.scale, t.scale, MTXMODE_APPLY);
+        GetItem_Draw(play, t.gid);
+        Matrix_Pop();
+    }
+
+    // A big golden Triforce floating over the park, visible from far away
+    Matrix_Push();
+    Matrix_Translate(0.0f, 420.0f, 0.0f, MTXMODE_APPLY);
+    Matrix_RotateY(static_cast<f32>(BINANG_TO_RAD((s16)(play->gameplayFrames * 0x100))), MTXMODE_APPLY);
+    Matrix_Scale(4.0f, 4.0f, 4.0f, MTXMODE_APPLY);
+    GetItem_Draw(play, GID_TRIFORCE_PIECE);
+    Matrix_Pop();
+
+    // Hylian Shields on the outside of the quarter pipes
+    for (f32 dir : { -1.0f, 1.0f }) {
+        Matrix_Push();
+        Matrix_Translate(0.0f, 60.0f, dir * (Park::kHalf + 3.0f), MTXMODE_APPLY);
+        Matrix_RotateY(dir > 0 ? 0.0f : kPi, MTXMODE_APPLY);
+        Matrix_Scale(3.0f, 3.0f, 3.0f, MTXMODE_APPLY);
+        GetItem_Draw(play, GID_SHIELD_HYLIAN);
+        Matrix_Pop();
+    }
+}
+
+static s16 ParkActorId() {
+    if (sPark.actorId < 0) {
+        ActorDBInit init;
+        init.name = "Skate_Park";
+        init.desc = "Hyrule Skate Park";
+        init.category = ACTORCAT_BG;
+        init.flags = ACTOR_FLAG_UPDATE_CULLING_DISABLED | ACTOR_FLAG_DRAW_CULLING_DISABLED;
+        init.objectId = OBJECT_GAMEPLAY_KEEP;
+        init.instanceSize = sizeof(DynaPolyActor);
+        init.init = ParkActor_Init;
+        init.destroy = ParkActor_Destroy;
+        init.update = ParkActor_Update;
+        init.draw = ParkActor_Draw;
+        sPark.actorId = (s16)ActorDB::Instance->AddEntry(init).entry.id;
+    }
+    return sPark.actorId;
+}
+
+// ---- placement ------------------------------------------------------------------------------------------------------
+
+struct TerrainSample {
+    bool ok;
+    f32 minY, maxY;
+};
+
+// Checks the field under a park centered at (cx, cz): solid, flat-ish, dry ground, no exits, no walls.
+// `detail` = false does a quick 3x3 pre-check.
+static TerrainSample SampleTerrain(PlayState* play, f32 cx, f32 cz, f32 probeY, bool detail) {
+    using namespace Park;
+    TerrainSample result = { false, 0.0f, 0.0f };
+    s32 n = detail ? 7 : 3;
+    f32 hx = kHalf + kRampLen;
+    f32 hz = kHalf;
+    bool first = true;
+    for (s32 ix = 0; ix < n; ix++) {
+        for (s32 iz = 0; iz < n; iz++) {
+            f32 x = cx - hx + 2.0f * hx * (f32)ix / (f32)(n - 1);
+            f32 z = cz - hz + 2.0f * hz * (f32)iz / (f32)(n - 1);
+            Vec3f probe = { x, probeY, z };
+            CollisionPoly* poly = NULL;
+            s32 bgId = BGCHECK_SCENE;
+            f32 y = BgCheck_EntityRaycastFloor3(&play->colCtx, &poly, &bgId, &probe);
+            if (poly == NULL || COLPOLY_GET_NORMAL(poly->normal.y) < 0.85f ||
+                SurfaceType_GetSceneExitIndex(&play->colCtx, poly, bgId) != 0 ||
+                SurfaceType_GetFloorType(&play->colCtx, poly, bgId) != 0) {
+                return result;
+            }
+            f32 waterY = y;
+            WaterBox* waterBox;
+            if (WaterBox_GetSurface1(play, &play->colCtx, x, z, &waterY, &waterBox) && waterY > y) {
+                return result;
+            }
+            if (first) {
+                result.minY = result.maxY = y;
+                first = false;
+            } else {
+                result.minY = std::min(result.minY, y);
+                result.maxY = std::max(result.maxY, y);
+            }
+        }
+    }
+    if (detail) {
+        // No walls, fences or rocks across the footprint
+        f32 y = result.maxY + 30.0f;
+        for (s32 i = 0; i < 5; i++) {
+            f32 t = -1.0f + 0.5f * (f32)i;
+            Vec3f a = { cx - hx, y, cz + t * hz };
+            Vec3f b = { cx + hx, y, cz + t * hz };
+            Vec3f c = { cx + t * kHalf, y, cz - hz };
+            Vec3f d = { cx + t * kHalf, y, cz + hz };
+            Vec3f hit;
+            CollisionPoly* poly;
+            s32 bgId;
+            if (BgCheck_EntityLineTest1(&play->colCtx, &a, &b, &hit, &poly, true, false, false, false, &bgId) ||
+                BgCheck_EntityLineTest1(&play->colCtx, &c, &d, &hit, &poly, true, false, false, false, &bgId)) {
+                return result;
+            }
+        }
+    }
+    result.ok = true;
+    return result;
+}
+
+static void SaveParkSpot() {
+    CVarSetInteger(CVAR_SKATE("Park.Placed"), 1);
+    CVarSetFloat(CVAR_SKATE("Park.X"), sPark.center.x);
+    CVarSetFloat(CVAR_SKATE("Park.Z"), sPark.center.z);
+    SaveCVars();
+}
+
+static bool LoadParkSpot() {
+    if (!CVarGetInteger(CVAR_SKATE("Park.Placed"), 0)) {
+        return false;
+    }
+    sPark.center.x = CVarGetFloat(CVAR_SKATE("Park.X"), 0.0f);
+    sPark.center.z = CVarGetFloat(CVAR_SKATE("Park.Z"), 0.0f);
+    return true;
+}
+
+static f32 GroundAt(PlayState* play, f32 x, f32 z, f32 probeY) {
+    Vec3f probe = { x, probeY, z };
+    CollisionPoly* poly = NULL;
+    s32 bgId;
+    f32 y = BgCheck_EntityRaycastFloor3(&play->colCtx, &poly, &bgId, &probe);
+    return (poly != NULL) ? y : probeY - 2000.0f;
+}
+
+// Measures the terrain at the saved spot and spawns the park on it
+static void SpawnPark(PlayState* play) {
+    using namespace Park;
+    f32 probeY = (f32)play->colCtx.maxBounds.y + 100.0f;
+    f32 cx = sPark.center.x;
+    f32 cz = sPark.center.z;
+    f32 minY = 0.0f, maxY = 0.0f;
+    bool first = true;
+    for (s32 ix = 0; ix < 7; ix++) {
+        for (s32 iz = 0; iz < 7; iz++) {
+            f32 y = GroundAt(play, cx - kHalf + 2.0f * kHalf * (f32)ix / 6.0f,
+                             cz - kHalf + 2.0f * kHalf * (f32)iz / 6.0f, probeY);
+            if (first) {
+                minY = maxY = y;
+                first = false;
+            } else {
+                minY = std::min(minY, y);
+                maxY = std::max(maxY, y);
+            }
+        }
+    }
+    sPark.center.y = maxY + 6.0f; // deck sits just above the highest bump
+    sPark.groundMin = minY;
+    sPark.rampFootY[0] = GroundAt(play, cx + kHalf + kRampLen, cz, probeY);
+    sPark.rampFootY[1] = GroundAt(play, cx - kHalf - kRampLen, cz, probeY);
+
+    BuildParkGeometry();
+    Actor* actor =
+        Actor_Spawn(&play->actorCtx, play, ParkActorId(), sPark.center.x, sPark.center.y, sPark.center.z, 0, 0, 0, 0);
+    sPark.actor = (DynaPolyActor*)actor;
+    sPark.placed = true;
+    sPark.failed = (actor == NULL);
+}
+
+static void RemovePark(PlayState* play) {
+    if (sPark.actor != nullptr && IsActorAlive(play, &sPark.actor->actor, ACTORCAT_BG)) {
+        NameTag_RemoveAllForActor(&sPark.actor->actor);
+        Actor_Kill(&sPark.actor->actor);
+    }
+}
+
+// Looks for the flattest open spot in Hyrule Field, a few candidates per frame so the game doesn't stall
+static void StartParkSearch(PlayState* play) {
+    sPark.searching = true;
+    sPark.found = false;
+    sPark.searchIdx = 0;
+    f32 margin = 1400.0f;
+    f32 w = (f32)(play->colCtx.maxBounds.x - play->colCtx.minBounds.x) - 2.0f * margin;
+    f32 d = (f32)(play->colCtx.maxBounds.z - play->colCtx.minBounds.z) - 2.0f * margin;
+    sPark.searchCols = std::max(1, (s32)(w / 350.0f));
+    s32 rows = std::max(1, (s32)(d / 350.0f));
+    sPark.searchCount = sPark.searchCols * rows;
+}
+
+static void UpdateParkSearch(PlayState* play) {
+    f32 margin = 1400.0f;
+    f32 probeY = (f32)play->colCtx.maxBounds.y + 100.0f;
+    f32 midX = ((f32)play->colCtx.minBounds.x + (f32)play->colCtx.maxBounds.x) * 0.5f;
+    f32 midZ = ((f32)play->colCtx.minBounds.z + (f32)play->colCtx.maxBounds.z) * 0.5f;
+    for (s32 n = 0; n < 12 && sPark.searchIdx < sPark.searchCount; n++, sPark.searchIdx++) {
+        f32 x = (f32)play->colCtx.minBounds.x + margin + 350.0f * (f32)(sPark.searchIdx % sPark.searchCols);
+        f32 z = (f32)play->colCtx.minBounds.z + margin + 350.0f * (f32)(sPark.searchIdx / sPark.searchCols);
+        if (!SampleTerrain(play, x, z, probeY, false).ok) {
+            continue;
+        }
+        TerrainSample s = SampleTerrain(play, x, z, probeY, true);
+        if (!s.ok) {
+            continue;
+        }
+        // flatter is better; among equally flat spots, prefer the middle of the field
+        f32 score = (s.maxY - s.minY) + 0.01f * sqrtf(SQ(x - midX) + SQ(z - midZ));
+        if (!sPark.found || score < sPark.bestScore) {
+            sPark.found = true;
+            sPark.bestScore = score;
+            sPark.bestCenter = V3(x, 0.0f, z);
+        }
+    }
+    if (sPark.searchIdx >= sPark.searchCount) {
+        sPark.searching = false;
+        if (sPark.found) {
+            sPark.center = sPark.bestCenter;
+            SaveParkSpot();
+            SpawnPark(play);
+            ShowMsg("A SKATE PARK APPEARED IN HYRULE FIELD!", MSG_GOOD, 80);
+        }
+    }
+}
+
+// ---- goals ----------------------------------------------------------------------------------------------------------
+
+static bool InParkArea(Player* player, Vec3f* local) {
+    if (sPark.actor == nullptr) {
+        return false;
+    }
+    Vec3f l = Sub(player->actor.world.pos, sPark.center);
+    if (local != nullptr) {
+        *local = l;
+    }
+    return std::fabs(l.x) < Park::kHalf + Park::kRampLen && std::fabs(l.z) < Park::kHalf + 50.0f;
+}
+
+static void CompleteParkGoal(s32 bit, const char* name) {
+    s32 done = ParkDone();
+    if (done & bit) {
+        return;
+    }
+    done |= bit;
+    CVarSetInteger(CVAR_SKATE("Park.Done"), done);
+    SaveCVars();
+    ShowMsg(std::string("PARK GOAL: ") + name, MSG_GOOD, 70);
+    Sfx_PlaySfxCentered(NA_SE_SY_CORRECT_CHIME);
+    if (Cfg_QuestRupees()) {
+        Rupees_ChangeBy(30);
+    }
+    if (done == PARK_ALL) {
+        ShowMsg("HYRULE SKATE PARK MASTERED!", MSG_GOOD, 100);
+        Sfx_PlaySfxCentered(NA_SE_SY_GET_ITEM);
+        if (Cfg_QuestRupees()) {
+            Rupees_ChangeBy(100);
+        }
+    }
+}
+
+static void UpdateParkTreasures(PlayState* play, Player* player) {
+    Vec3f local;
+    if (!InParkArea(player, &local)) {
+        return;
+    }
+    f32 age = AgeScale();
+    s32 mask = ParkTreasureMask();
+    for (s32 i = 0; i < kParkTreasureCount; i++) {
+        if (mask & (1 << i)) {
+            continue;
+        }
+        const ParkTreasure& t = sParkTreasures[i];
+        f32 dx = t.local.x - local.x;
+        f32 dz = t.local.z - local.z;
+        f32 dy = t.local.y - (local.y + 25.0f * age);
+        if (SQ(dx) + SQ(dz) < SQ(45.0f * age) && std::fabs(dy) < 50.0f * age) {
+            mask |= 1 << i;
+            CVarSetInteger(CVAR_SKATE("Park.Treasures"), mask);
+            SaveCVars();
+            sSkate.combo.Add(t.name, 500);
+            ShowMsg(std::string("GOT THE ") + t.name + "!", MSG_GOOD, 45);
+            Sfx_PlaySfxCentered(NA_SE_SY_GET_ITEM);
+            Vec3f world = V3(sPark.center.x + t.local.x, sPark.center.y + t.local.y, sPark.center.z + t.local.z);
+            static Color_RGBA8 sPrim = { 255, 255, 200, 255 };
+            static Color_RGBA8 sEnv = { 120, 200, 255, 255 };
+            for (s32 k = 0; k < 8; k++) {
+                Vec3f vel = { Rand_CenteredFloat(5.0f), 2.0f + Rand_ZeroOne() * 4.0f, Rand_CenteredFloat(5.0f) };
+                Vec3f accel = { 0.0f, -0.3f, 0.0f };
+                EffectSsKiraKira_SpawnSmall(play, &world, &vel, &accel, &sPrim, &sEnv);
+            }
+        }
+    }
+    if ((mask & 7) == 7) {
+        CompleteParkGoal(PARK_STONES, "SPIRITUAL STONES");
+    }
+    if ((mask & 24) == 24) {
+        CompleteParkGoal(PARK_VERT, "VERT TREASURES");
+    }
+}
+
+static std::string ParkHudLine() {
+    s32 mask = ParkTreasureMask();
+    s32 done = ParkDone();
+    s32 stones = (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1);
+    s32 vert = ((mask >> 3) & 1) + ((mask >> 4) & 1);
+    std::string text = "STONES " + std::to_string(stones) + "/3  VERT " + std::to_string(vert) + "/2";
+    text += (done & PARK_TRIGAP) ? "  TRI-GAP OK" : "  TRI-GAP -";
+    text += (done & PARK_COMBO) ? "  10K OK" : "  10K -";
+    return text;
+}
+
+static std::string ParkDirectionHint(Player* player) {
+    f32 dist = Math_Vec3f_DistXZ(&player->actor.world.pos, &sPark.center);
+    s16 rel = (s16)(Math_Vec3f_Yaw(&player->actor.world.pos, &sPark.center) - sSkate.moveYaw);
+    const char* dir = "AHEAD";
+    if (ABS(rel) > 0x6000) {
+        dir = "BEHIND";
+    } else if (rel > 0x1800) {
+        dir = "LEFT";
+    } else if (rel < -0x1800) {
+        dir = "RIGHT";
+    }
+    return std::string("SKATE PARK ") + dir + " " + std::to_string((s32)dist);
+}
+
+// True when Link's floor is part of the park (the park's ramps get skate-park physics)
+static bool OnParkFloor(Player* player) {
+    return sPark.actor != nullptr && sPark.bgId >= 0 && player->actor.floorBgId == sPark.bgId &&
+           (player->actor.bgCheckFlags & BGCHECKFLAG_GROUND);
+}
+
+// Called every air frame and on landing, for the Triforce gap
+static void ParkAirTrack(Player* player) {
+    Vec3f local;
+    if (!InParkArea(player, &local)) {
+        return;
+    }
+    Vec3f T, L, R, mTL, mTR, mLR;
+    TriforcePoints(&T, &L, &R, &mTL, &mTR, &mLR);
+    if (local.y > Park::kBoxHeight - 10.0f && PointInTri(local.x, local.z, mTL, mTR, mLR)) {
+        sPark.overTriHole = true;
+    }
+}
+
+static void ParkCheckTriforceGap(Player* player) {
+    Vec3f local;
+    if (!sPark.overTriHole || !InParkArea(player, &local)) {
+        sPark.overTriHole = false;
+        return;
+    }
+    sPark.overTriHole = false;
+    Vec3f T, L, R, mTL, mTR, mLR;
+    TriforcePoints(&T, &L, &R, &mTL, &mTR, &mLR);
+    bool onPiece = std::fabs(local.y - Park::kBoxHeight) < 12.0f &&
+                   (PointInTri(local.x, local.z, T, mTL, mTR) || PointInTri(local.x, local.z, mTL, L, mLR) ||
+                    PointInTri(local.x, local.z, mTR, mLR, R));
+    if (onPiece) {
+        sSkate.combo.Add("TRIFORCE GAP", 1500);
+        ShowMsg("TRIFORCE GAP!", MSG_GOOD, 45);
+        Sfx_PlaySfxCentered(NA_SE_SY_TRE_BOX_APPEAR);
+        CompleteParkGoal(PARK_TRIGAP, "TRIFORCE GAP");
+    }
+}
+
+// Per frame, from OnPlayerUpdate
+static void UpdatePark(PlayState* play, Player* player, bool riding) {
+    bool wanted = Cfg_Park() && play->sceneNum == SCENE_HYRULE_FIELD;
+    if (!wanted) {
+        if (sPark.actor != nullptr) {
+            RemovePark(play);
+        }
+        return;
+    }
+    if (sPark.respawn) {
+        // Waiting for the old park to be cleaned up before building the new one
+        if (sPark.actor == nullptr || !IsActorAlive(play, &sPark.actor->actor, ACTORCAT_BG)) {
+            sPark.actor = nullptr;
+            sPark.respawn = false;
+            SpawnPark(play);
+        }
+        return;
+    }
+    if (sPark.actor == nullptr && !sPark.searching && !sPark.failed && sSkate.sceneFrames >= 2) {
+        if (LoadParkSpot()) {
+            SpawnPark(play);
+        } else {
+            StartParkSearch(play);
+        }
+    }
+    if (sPark.searching) {
+        UpdateParkSearch(play);
+        return;
+    }
+    if (sPark.actor == nullptr) {
+        return;
+    }
+    if (riding) {
+        UpdateParkTreasures(play, player);
+        if (!sPark.announced && InParkArea(player, nullptr)) {
+            sPark.announced = true;
+            if (ParkDone() != PARK_ALL) {
+                ShowMsg("HYRULE SKATE PARK", MSG_INFO, 50);
+            }
+        }
+    }
+}
+
+// The quarter pipes send you straight up when you reach the lip (they end in a flat platform, so without this
+// you'd just roll onto it). You drift back over the ramp and land on it again.
+static bool ParkAtLip(Player* player) {
+    Vec3f local;
+    if (!OnParkFloor(player) || !InParkArea(player, &local)) {
+        return false;
+    }
+    if (std::fabs(local.x) > Park::kQpHalfWidth || std::fabs(local.z) < Park::kQpLip - 18.0f ||
+        std::fabs(local.z) > Park::kQpLip) {
+        return false;
+    }
+    f32 outward = Math_CosS(sSkate.moveYaw) * (local.z > 0.0f ? 1.0f : -1.0f);
+    return outward > 0.5f && sSkate.speed > 1.0f;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Combo handling
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -1022,6 +1919,10 @@ static void BankCombo() {
         Sfx_PlaySfxCentered(NA_SE_SY_CORRECT_CHIME);
     }
     ShowMsg(text, MSG_GOOD, 50);
+
+    if (gPlayState != nullptr && total >= 10000 && InParkArea(GET_PLAYER(gPlayState), nullptr)) {
+        CompleteParkGoal(PARK_COMBO, "10,000 COMBO");
+    }
 
     if (Cfg_Quests() && gPlayState != nullptr && IsQuestArea(gPlayState->sceneNum) && total >= Tune::kQuestComboGoal) {
         CompleteQuest(gPlayState->sceneNum, QUEST_COMBO, "5000 COMBO");
@@ -1463,6 +2364,8 @@ static void StartAir(Player* player, f32 launchVelY) {
     if (launchVelY > player->actor.velocity.y) {
         player->actor.velocity.y = launchVelY;
     }
+    sPark.overTriHole = false;
+
     // Gap tracking: remember where we took off and watch what we fly over
     sSkate.airTracking = true;
     sSkate.fromGrind = false;
@@ -1531,7 +2434,30 @@ static void UpdateGround(PlayState* play, Player* player, Input* input) {
         sSkate.lastRise = 0.0f;
         Math_StepToF(&sSkate.speed, 0.0f, 0.02f); // water drags a little more than pavement
     }
-    sSkate.speed += slopeAlong * Tune::kSlopeAccel;
+    sSkate.onPark = OnParkFloor(player);
+    // Skate park ramps keep more of your momentum going up, so you can pump the half pipe
+    f32 slopeAccel = (sSkate.onPark && slopeAlong < 0.0f) ? 0.35f : Tune::kSlopeAccel;
+    sSkate.speed += slopeAlong * slopeAccel;
+
+    // Stalled on a slope facing uphill: roll back down backwards (fakie)
+    if (sSkate.speed < 0.5f && slopeAlong < -0.08f && !sSkate.charging) {
+        sSkate.moveYaw = (s16)(sSkate.moveYaw + 0x8000);
+        sSkate.fakie = !sSkate.fakie;
+        sSkate.speed = std::fabs(sSkate.speed) + 0.5f;
+    }
+
+    // Quarter pipe lip: launch straight up
+    if (ParkAtLip(player)) {
+        f32 vy = std::max(sSkate.speed, 3.0f) * 1.4f;
+        StartAir(player, vy);
+        sSkate.speed = -1.0f; // drift back over the ramp so you land on it
+        sSkate.charging = false;
+        sSkate.chargeFrames = 0;
+        PlaySfx(player, NA_SE_IT_SHIELD_BOUND);
+        sSkate.anim = ANIM_NONE;
+        SetAnim(play, player, ANIM_AIR_UP);
+        return;
+    }
 
     // Steering: tighter at low speed
     s16 turn = (s16)(-sx * Tune::kTurnRate * (1.2f - std::min(sSkate.speed, 12.0f) / 24.0f));
@@ -1691,6 +2617,7 @@ static void Land(PlayState* play, Player* player) {
 
     FinalizeSpin();
     CheckGap(play, player, false);
+    ParkCheckTriforceGap(player);
     BankCombo();
 
     sSkate.phase = PHASE_GROUND;
@@ -1715,6 +2642,8 @@ static void Land(PlayState* play, Player* player) {
 static void UpdateAir(PlayState* play, Player* player, Input* input) {
     f32 sx = StickX(input);
     StickDir dir = GetStickDir(input);
+
+    ParkAirTrack(player);
 
     // Gap tracking: the deepest floor and any water we pass over
     if (sSkate.airTracking) {
@@ -2228,7 +3157,16 @@ static void HudDraw(GfxPrint* printer) {
         }
     }
 
-    if (sSkate.active && Cfg_Quests() && gPlayState != nullptr && IsQuestArea(gPlayState->sceneNum)) {
+    bool inPark = sSkate.active && gPlayState != nullptr && InParkArea(GET_PLAYER(gPlayState), nullptr);
+    if (inPark) {
+        GfxPrint_SetColor(printer, ParkDone() == PARK_ALL ? 120 : 255, 230, 120, 255);
+        HudPrintCentered(printer, 25, ParkHudLine());
+    } else if (sSkate.active && gPlayState != nullptr && sPark.actor != nullptr) {
+        GfxPrint_SetColor(printer, 180, 220, 255, 255);
+        HudPrintCentered(printer, 27, ParkDirectionHint(GET_PLAYER(gPlayState)));
+    }
+
+    if (!inPark && sSkate.active && Cfg_Quests() && gPlayState != nullptr && IsQuestArea(gPlayState->sceneNum)) {
         s32 scene = gPlayState->sceneNum;
         GfxPrint_SetColor(printer, QuestDone(scene) == QUEST_ALL ? 120 : 255, 230, 120, 255);
         HudPrintCentered(printer, 25, QuestHudLine(scene));
@@ -2334,6 +3272,7 @@ static void OnPlayerUpdate() {
     }
 
     UpdateBomb(gPlayState, player, riding);
+    UpdatePark(gPlayState, player, riding);
 
     // Seamless loading zones: we rolled into a new area. Skip Link's walk-in and put him straight back on the board.
     if (sSkate.carryPending && !sSkate.carryActive && ++sSkate.carryTimer > 30) {
@@ -2427,6 +3366,13 @@ static void OnPlayDestroy() {
     sSkate.sceneFrames = 0;
     sGoalsShown = false;
     ClearLetters();
+    sPark.actor = nullptr; // destroyed with the area
+    sPark.bgId = -1;
+    sPark.searching = false;
+    sPark.respawn = false;
+    sPark.failed = false;
+    sPark.announced = false;
+    sPark.overTriHole = false;
     // Hop back on in the next area (loading zones, doors, voids)
     sSkate.remountPending = (sSkate.remountPending || wasRiding) && Cfg_KeepBoard();
     sSkate.remountTimer = 100;
@@ -2612,8 +3558,68 @@ static void RegisterSkateboardWidgets() {
                 CVarClear(QuestKey("Letters", scene).c_str());
                 CVarClear(QuestKey("Gaps", scene).c_str());
             }
+            CVarClear(CVAR_SKATE("Park.Done"));
+            CVarClear(CVAR_SKATE("Park.Treasures"));
             SaveCVars();
             ClearLetters(); // they get placed again, uncollected
+        });
+
+    SohGui::mSohMenu->AddWidget(path, "Hyrule Skate Park", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_SKATE("Park"))
+        .PreFunc(disabledIfOff)
+        .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
+            "An Ocarina of Time themed skate park in Hyrule Field: half pipe, Triforce funbox, Master Sword rails,\n"
+            "Goron funboxes. Grab the Spiritual Stones and the vert treasures, clear the Triforce gap and land a\n"
+            "10,000 point combo. The first time you visit Hyrule Field it finds a flat open spot for itself."));
+
+    SohGui::mSohMenu->AddWidget(path, "Teleport to the Skate Park", WIDGET_BUTTON)
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !SKATE_ENABLED || !Cfg_Park();
+            info.options->disabled =
+                gPlayState == nullptr || gPlayState->sceneNum != SCENE_HYRULE_FIELD || sPark.actor == nullptr;
+            info.options->disabledTooltip = "Only in Hyrule Field, once the park is there.";
+        })
+        .Callback([](WidgetInfo&) {
+            if (gPlayState == nullptr || sPark.actor == nullptr) {
+                return;
+            }
+            Player* player = GET_PLAYER(gPlayState);
+            Vec3f pos = { sPark.center.x + Park::kHalf + Park::kRampLen + 60.0f, sPark.rampFootY[0] + 20.0f,
+                          sPark.center.z };
+            player->actor.world.pos = player->actor.home.pos = player->actor.prevPos = pos;
+            player->actor.shape.rot.y = player->actor.world.rot.y = player->yaw = (s16)0xC000; // face the park
+            player->linearVelocity = 0.0f;
+        });
+
+    SohGui::mSohMenu->AddWidget(path, "Move the Skate Park Here", WIDGET_BUTTON)
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !SKATE_ENABLED || !Cfg_Park();
+            info.options->disabled = gPlayState == nullptr || gPlayState->sceneNum != SCENE_HYRULE_FIELD;
+            info.options->disabledTooltip = "Stand where you want it in Hyrule Field.";
+        })
+        .Callback([](WidgetInfo&) {
+            if (gPlayState == nullptr || gPlayState->sceneNum != SCENE_HYRULE_FIELD) {
+                return;
+            }
+            Player* player = GET_PLAYER(gPlayState);
+            sPark.center.x = player->actor.world.pos.x;
+            sPark.center.z = player->actor.world.pos.z;
+            SaveParkSpot();
+            sPark.searching = false;
+            sPark.failed = false;
+            RemovePark(gPlayState);
+            sPark.respawn = true;
+        });
+
+    SohGui::mSohMenu->AddWidget(path, "Find a New Park Spot Automatically", WIDGET_BUTTON)
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !SKATE_ENABLED || !Cfg_Park(); })
+        .Callback([](WidgetInfo&) {
+            CVarClear(CVAR_SKATE("Park.Placed"));
+            SaveCVars();
+            sPark.failed = false;
+            if (gPlayState != nullptr) {
+                RemovePark(gPlayState);
+            }
         });
 
     SohGui::mSohMenu->AddWidget(path, "Show Trick HUD", WIDGET_CVAR_CHECKBOX)
