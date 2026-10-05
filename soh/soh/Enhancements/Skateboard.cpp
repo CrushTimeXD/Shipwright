@@ -148,7 +148,9 @@ constexpr f32 kRampLaunch = 0.9f;
 constexpr f32 kGrindMinSpeed = 2.5f;
 constexpr f32 kGrindFriction = 0.025f;
 constexpr f32 kWallBailSpeed = 11.0f;
-constexpr s16 kPushCooldown = 9;
+constexpr s16 kPushFrames = 12;      // length of one push stroke (also the minimum time between pushes)
+constexpr s16 kPushContactStart = 3; // the kicking foot touches the ground on this frame of the stroke...
+constexpr s16 kPushContactEnd = 8;   // ...and leaves it here; the speed is added in between
 } // namespace Tune
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -222,7 +224,17 @@ static const GrindTrick sGrindTricks[] = {
 
 enum SkatePhase { PHASE_GROUND, PHASE_AIR, PHASE_GRIND };
 
-enum SkateAnim { ANIM_NONE, ANIM_RIDE, ANIM_CROUCH, ANIM_AIR_UP, ANIM_AIR_DOWN, ANIM_TUCK, ANIM_GRIND, ANIM_LAND };
+enum SkateAnim {
+    ANIM_NONE,
+    ANIM_RIDE,
+    ANIM_CROUCH,
+    ANIM_AIR_UP,
+    ANIM_AIR_DOWN,
+    ANIM_TUCK,
+    ANIM_GRIND,
+    ANIM_LAND,
+    ANIM_PUSH
+};
 
 enum HudMsgColor { MSG_GOOD, MSG_BAD, MSG_INFO };
 
@@ -269,6 +281,9 @@ struct SkateState {
     f32 speed = 0.0f;
     bool fakie = false;
     s16 pushCooldown = 0;
+    s16 pushTimer = 0;        // counts down through a push stroke
+    f32 pushBlend = 0.0f;     // 0 = standing sideways on the board, 1 = turned forward to push
+    f32 pushStrideEnd = 0.0f; // last animation frame of the stride we play for the kick
     s16 chargeFrames = 0;
     bool charging = false;
     f32 lastRise = 0.0f;    // slope along the travel direction on the last grounded frame
@@ -491,6 +506,13 @@ static void SetAnim(PlayState* play, Player* player, SkateAnim anim) {
             header = (LinkAnimationHeader*)gPlayerAnim_link_normal_down_slope_slip;
             LinkAnimation_Change(play, &player->skelAnime, header, 1.0f, 0.0f, 0.0f, ANIMMODE_LOOP, -4.0f);
             break;
+        case ANIM_PUSH:
+            // One stride of Link's run cycle: the planted leg sweeps back along the ground while the arms swing.
+            // We drive the frame ourselves (play speed 0) so the stroke lines up with the speed boost.
+            header = (LinkAnimationHeader*)gPlayerAnim_link_normal_run_free;
+            sSkate.pushStrideEnd = Animation_GetLastFrame(header) * 0.5f;
+            LinkAnimation_Change(play, &player->skelAnime, header, 0.0f, 0.0f, 0.0f, ANIMMODE_LOOP, -3.0f);
+            break;
         case ANIM_LAND:
             header = (LinkAnimationHeader*)gPlayerAnim_link_normal_short_landing_free;
             LinkAnimation_Change(play, &player->skelAnime, header, 1.0f, 0.0f, Animation_GetLastFrame(header),
@@ -585,6 +607,8 @@ static void ClearRideState() {
     sSkate.grabFrames = 0;
     sSkate.spin = 0;
     sSkate.anim = ANIM_NONE;
+    sSkate.pushTimer = 0;
+    sSkate.pushBlend = 0.0f;
 }
 
 static void Dismount(PlayState* play, Player* player) {
@@ -665,6 +689,7 @@ static void TryMount(PlayState* play, Player* player) {
 
 static void StartAir(Player* player, f32 launchVelY) {
     sSkate.phase = PHASE_AIR;
+    sSkate.pushTimer = 0;
     sSkate.spin = 0;
     sSkate.airTrickStart = (s32)sSkate.combo.names.size();
     sSkate.flipIdx = -1;
@@ -682,6 +707,7 @@ static void StartGrind(PlayState* play, Player* player, Input* input, const Vec3
         FinalizeSpin();
     }
     sSkate.phase = PHASE_GRIND;
+    sSkate.pushTimer = 0;
     sSkate.grindIdx = GetStickDir(input);
     sSkate.grindFrames = 0;
     sSkate.grindYaw = yaw;
@@ -745,13 +771,39 @@ static void UpdateGround(PlayState* play, Player* player, Input* input) {
     }
     Math_StepToF(&sSkate.speed, 0.0f, Tune::kFriction + std::fabs(sx) * 0.02f);
 
-    // Push
-    if (CHECK_BTN_ALL(input->press.button, BTN_B) && sSkate.pushCooldown == 0 && !sSkate.charging) {
-        if (sSkate.speed < Tune::kPushMax * speedMult) {
-            sSkate.speed = std::min(sSkate.speed + Tune::kPushImpulse * speedMult, Tune::kPushMax * speedMult);
+    // Push: tap B for one stroke, hold B to keep pushing
+    bool wantPush = CHECK_BTN_ALL(input->press.button, BTN_B) || CHECK_BTN_ALL(input->cur.button, BTN_B);
+    if (wantPush && sSkate.pushCooldown == 0 && !sSkate.charging && !CHECK_BTN_ALL(input->cur.button, BTN_A)) {
+        sSkate.pushTimer = Tune::kPushFrames;
+        sSkate.pushCooldown = Tune::kPushFrames;
+        sSkate.anim = ANIM_NONE; // restart the stroke even if we were already pushing
+        SetAnim(play, player, ANIM_PUSH);
+    }
+    if (sSkate.pushTimer > 0) {
+        s16 stroke = Tune::kPushFrames - sSkate.pushTimer; // 0, 1, 2, ...
+
+        // The foot is on the ground: add the speed a bit at a time
+        if (stroke >= Tune::kPushContactStart && stroke < Tune::kPushContactEnd) {
+            f32 perFrame = Tune::kPushImpulse * speedMult / (f32)(Tune::kPushContactEnd - Tune::kPushContactStart);
+            if (sSkate.speed < Tune::kPushMax * speedMult) {
+                sSkate.speed = std::min(sSkate.speed + perFrame, Tune::kPushMax * speedMult);
+            }
         }
-        sSkate.pushCooldown = Tune::kPushCooldown;
-        Player_PlaySfx(&player->actor, NA_SE_PL_WALK_GROUND + player->floorSfxOffset);
+
+        // Foot hits the ground: scuff sound and a puff of dust (or a splash on water)
+        if (stroke == Tune::kPushContactStart) {
+            Vec3f footPos = player->actor.world.pos;
+            footPos.x -= Math_SinS(sSkate.moveYaw) * 8.0f * AgeScale();
+            footPos.z -= Math_CosS(sSkate.moveYaw) * 8.0f * AgeScale();
+            if (sSkate.onWater) {
+                PlaySfx(player, NA_SE_PL_WALK_WATER1);
+                EffectSsGRipple_Spawn(play, &footPos, 60, 250, 0);
+            } else {
+                PlaySfx(player, (u16)(NA_SE_PL_WALK_GROUND + player->floorSfxOffset));
+                Actor_SpawnFloorDustRing(play, &player->actor, &footPos, 4.0f, 2, 2.0f, 80, 12, false);
+            }
+        }
+        sSkate.pushTimer--;
     }
 
     // Crouch + ollie
@@ -797,7 +849,11 @@ static void UpdateGround(PlayState* play, Player* player, Input* input) {
 
     sSkate.speed = std::clamp(sSkate.speed, 0.0f, Tune::kMaxSpeed * speedMult);
 
-    if (!sSkate.charging) {
+    if (sSkate.charging) {
+        sSkate.pushTimer = 0;
+    } else if (sSkate.pushTimer > 0) {
+        // keep the push stroke playing
+    } else {
         if (sSkate.anim == ANIM_LAND) {
             if (player->skelAnime.curFrame >= player->skelAnime.endFrame) {
                 SetAnim(play, player, ANIM_RIDE);
@@ -1016,7 +1072,10 @@ static void UpdateGrind(PlayState* play, Player* player, Input* input) {
 
 static void UpdateVisuals(Player* player) {
     s16 stanceSign = (Cfg_Stance() == STANCE_GOOFY) ? -1 : 1;
-    s16 baseBody = (s16)(sSkate.moveYaw + stanceSign * 0x4000 + (sSkate.fakie ? 0x8000 : 0));
+    // Turn from sideways (riding stance) to facing forward while pushing, then back
+    Math_StepToF(&sSkate.pushBlend, (sSkate.pushTimer > 0 && sSkate.phase == PHASE_GROUND) ? 1.0f : 0.0f, 0.25f);
+    s16 stanceOffset = (s16)(stanceSign * 0x4000 + (sSkate.fakie ? 0x8000 : 0));
+    s16 baseBody = (s16)(sSkate.moveYaw + (s16)(stanceOffset * (1.0f - sSkate.pushBlend)));
 
     sSkate.boardYaw = sSkate.moveYaw + (s16)sSkate.boardYawBase;
     sSkate.boardPitch = 0;
@@ -1056,6 +1115,8 @@ static void UpdateVisuals(Player* player) {
             break;
         }
         default:
+            // Lean into the push
+            targetTiltX = (s16)(0x0700 * sSkate.pushBlend);
             break;
     }
 
@@ -1094,6 +1155,11 @@ void Skate_Action(Player* player, PlayState* play) {
     player->actor.gravity = Tune::kGravity;
     player->actor.minVelocityY = -20.0f;
 
+    if (sSkate.anim == ANIM_PUSH) {
+        // Ease through one stride so the kick starts slow, sweeps back, and settles
+        f32 t = 1.0f - (f32)sSkate.pushTimer / Tune::kPushFrames;
+        player->skelAnime.curFrame = sSkate.pushStrideEnd * (0.5f - 0.5f * cosf(t * kPi));
+    }
     LinkAnimation_Update(play, &player->skelAnime);
 
     if (sSkate.pushCooldown > 0) {
