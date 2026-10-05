@@ -19,6 +19,10 @@
  *  B (ground) .......... push                         A ...................... hold to crouch, release to ollie
  *  B + direction (air) . flip tricks                  R + direction (air) .... grabs (hold for more points)
  *  R near a ledge ...... grind (hold R while landing on an edge, or press R while rolling along one)
+ *  A against a wall .... wall jump (in the air)       Bombs button (or Z) .... bomb hop
+ *  R next to Epona ..... hold on and get towed, steer with the stick, let go to slingshot
+ *
+ * Extras: seamless loading zones while riding, and per-area quests (spell Z-E-L-D-A, clear gaps, big combo).
  */
 
 #include <libultraship/bridge/consolevariablebridge.h>
@@ -28,6 +32,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <string>
@@ -40,6 +46,8 @@
 #include "soh/SohGui/MenuTypes.h"
 #include "soh/SohGui/SohMenu.h"
 #include "soh/SohGui/SohGui.hpp"
+#include "soh/Enhancements/nametag.h"
+#include "soh/util.h"
 
 namespace SohGui {
 extern std::shared_ptr<SohMenu> mSohMenu;
@@ -51,6 +59,7 @@ extern "C" {
 #include "variables.h"
 #include "functions.h"
 #include "objects/gameplay_keep/gameplay_keep.h"
+#include "overlays/actors/ovl_En_Horse/z_en_horse.h"
 extern PlayState* gPlayState;
 
 // Player functions from z_player.c (C linkage, not static)
@@ -68,6 +77,12 @@ void Player_Action_8084170C(Player* player, PlayState* play);
 void Player_Action_808417FC(Player* player, PlayState* play);
 void Player_Action_8084193C(Player* player, PlayState* play); // targeted walk
 void Player_Action_80842180(Player* player, PlayState* play); // run
+void Player_Action_80845CA4(Player* player, PlayState* play); // walking into / out of an area
+s32 func_80845C68(PlayState* play, s32 arg1);                 // sets the void-out respawn point after walking in
+
+// Epona (z_en_horse.c, not static)
+void EnHorse_InitFleePlayer(EnHorse* horse);
+void EnHorse_StartIdleRidable(EnHorse* horse);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -118,6 +133,21 @@ static bool Cfg_WaterSkate() {
 static s32 Cfg_BoardOrientation() {
     return CVarGetInteger(CVAR_SKATE("BoardOrientation"), 0);
 }
+static bool Cfg_Seamless() {
+    return CVarGetInteger(CVAR_SKATE("SeamlessAreas"), 1) != 0;
+}
+static bool Cfg_Quests() {
+    return CVarGetInteger(CVAR_SKATE("Quests"), 1) != 0;
+}
+static bool Cfg_QuestRupees() {
+    return CVarGetInteger(CVAR_SKATE("QuestRupees"), 1) != 0;
+}
+static bool Cfg_WallJumps() {
+    return CVarGetInteger(CVAR_SKATE("WallJumps"), 1) != 0;
+}
+static bool Cfg_FreeBombs() {
+    return CVarGetInteger(CVAR_SKATE("FreeBombs"), 0) != 0;
+}
 static f32 Cfg_SpeedMult() {
     return CVarGetFloat(CVAR_SKATE("SpeedMult"), 1.0f);
 }
@@ -151,6 +181,19 @@ constexpr f32 kWallBailSpeed = 11.0f;
 constexpr s16 kPushFrames = 12;      // length of one push stroke (also the minimum time between pushes)
 constexpr s16 kPushContactStart = 3; // the kicking foot touches the ground on this frame of the stroke...
 constexpr s16 kPushContactEnd = 8;   // ...and leaves it here; the speed is added in between
+constexpr f32 kWallJumpVelY = 9.0f;
+constexpr s16 kWallJumpMax = 3;    // wall jumps per jump
+constexpr s16 kWallJumpBuffer = 6; // A can be pressed this many frames before touching the wall
+constexpr s16 kBombFuse = 10;
+constexpr f32 kBombRadius = 110.0f;
+constexpr f32 kBombLaunchY = 15.0f;
+constexpr f32 kBombBoost = 4.0f;
+constexpr f32 kTowGrabRange = 120.0f;
+constexpr f32 kTowDistance = 85.0f; // how far behind Epona's middle Link hangs on
+constexpr f32 kTowLoseGrip = 260.0f;
+constexpr f32 kTowSlingshot = 4.0f;
+constexpr s32 kQuestComboGoal = 5000;
+constexpr s32 kQuestGapGoal = 3;
 } // namespace Tune
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -233,7 +276,8 @@ enum SkateAnim {
     ANIM_TUCK,
     ANIM_GRIND,
     ANIM_LAND,
-    ANIM_PUSH
+    ANIM_PUSH,
+    ANIM_TOW
 };
 
 enum HudMsgColor { MSG_GOOD, MSG_BAD, MSG_INFO };
@@ -300,6 +344,32 @@ struct SkateState {
     s32 grabIdx = -1;
     s16 grabFrames = 0;
     s16 noGrindTimer = 0;
+    s16 aBuffer = 0;   // recent A press in the air, for wall jumps
+    s16 wallJumps = 0; // wall jumps during this jump
+
+    // gap detection
+    bool airTracking = false;
+    bool fromGrind = false;
+    bool airOverWater = false;
+    Vec3f takeoffPos = { 0.0f, 0.0f, 0.0f };
+    f32 airLowestFloor = 0.0f;
+
+    // bomb hop
+    bool bombActive = false;
+    Vec3f bombPos = { 0.0f, 0.0f, 0.0f };
+    f32 bombVelY = 0.0f;
+    s16 bombTimer = 0;
+
+    // Epona tow
+    EnHorse* towHorse = nullptr;
+    s32 towFrames = 0;
+
+    // seamless loading zones
+    bool carryPending = false; // rode into a loading zone, waiting for the next area
+    bool carryActive = false;  // the next area has loaded: hop back on as soon as Link appears
+    s16 carryTimer = 0;
+    f32 carrySpeed = 0.0f;
+    s32 sceneFrames = 0;
 
     // grind
     s32 grindIdx = 0;
@@ -322,6 +392,13 @@ struct SkateState {
     s16 msgTimer = 0;
     HudMsgColor msgColor = MSG_INFO;
 };
+
+struct HudMsg {
+    std::string text;
+    HudMsgColor color;
+    s16 frames;
+};
+static std::vector<HudMsg> sMsgQueue; // messages waiting their turn behind the one on screen
 
 static SkateState sSkate;
 static Input* sActionInput = nullptr;
@@ -366,9 +443,56 @@ static StickDir GetStickDir(Input* input) {
 }
 
 static void ShowMsg(const std::string& text, HudMsgColor color, s16 frames = 40) {
-    sSkate.msg = text;
-    sSkate.msgColor = color;
-    sSkate.msgTimer = frames;
+    if (sSkate.msgTimer <= 0) {
+        sSkate.msg = text;
+        sSkate.msgColor = color;
+        sSkate.msgTimer = frames;
+    } else if (sMsgQueue.size() < 4) {
+        // Show it right after the current one, a bit shorter so the queue doesn't lag behind the action
+        sMsgQueue.push_back({ text, color, (s16)std::max(25, frames * 3 / 4) });
+    }
+}
+
+static void UpdateMessages() {
+    if (sSkate.msgTimer > 0) {
+        sSkate.msgTimer--;
+    }
+    if (sSkate.msgTimer <= 0 && !sMsgQueue.empty()) {
+        sSkate.msg = sMsgQueue.front().text;
+        sSkate.msgColor = sMsgQueue.front().color;
+        sSkate.msgTimer = sMsgQueue.front().frames;
+        sMsgQueue.erase(sMsgQueue.begin());
+    }
+}
+
+static void SaveCVars() {
+    Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
+}
+
+static bool IsActorAlive(PlayState* play, Actor* target, s32 category) {
+    for (Actor* actor = play->actorCtx.actorLists[category].head; actor != NULL; actor = actor->next) {
+        if (actor == target) {
+            return actor->update != NULL;
+        }
+    }
+    return false;
+}
+
+static void DrawItemAt(PlayState* play, void* key, Vec3f pos, s16 gid, f32 scale, s16 yaw) {
+    OPEN_DISPS(play->state.gfxCtx);
+    FrameInterpolation_RecordOpenChild(key, 0);
+
+    Lights* lights = LightContext_NewLights(&play->lightCtx, play->state.gfxCtx);
+    Lights_BindAll(lights, play->lightCtx.listHead, &pos);
+    Lights_Draw(lights, play->state.gfxCtx);
+
+    Matrix_Translate(pos.x, pos.y, pos.z, MTXMODE_NEW);
+    Matrix_RotateY(static_cast<f32>(BINANG_TO_RAD(yaw)), MTXMODE_APPLY);
+    Matrix_Scale(scale, scale, scale, MTXMODE_APPLY);
+    GetItem_Draw(play, gid);
+
+    FrameInterpolation_RecordCloseChild();
+    CLOSE_DISPS(play->state.gfxCtx);
 }
 
 static void PlaySfx(Player* player, u16 sfx) {
@@ -513,6 +637,11 @@ static void SetAnim(PlayState* play, Player* player, SkateAnim anim) {
             sSkate.pushStrideEnd = Animation_GetLastFrame(header) * 0.5f;
             LinkAnimation_Change(play, &player->skelAnime, header, 0.0f, 0.0f, 0.0f, ANIMMODE_LOOP, -3.0f);
             break;
+        case ANIM_TOW:
+            // Arms out in front, holding on
+            header = (LinkAnimationHeader*)gPlayerAnim_link_normal_carryB_wait;
+            LinkAnimation_Change(play, &player->skelAnime, header, 1.0f, 0.0f, 0.0f, ANIMMODE_LOOP, -4.0f);
+            break;
         case ANIM_LAND:
             header = (LinkAnimationHeader*)gPlayerAnim_link_normal_short_landing_free;
             LinkAnimation_Change(play, &player->skelAnime, header, 1.0f, 0.0f, Animation_GetLastFrame(header),
@@ -521,6 +650,355 @@ static void SetAnim(PlayState* play, Player* player, SkateAnim anim) {
         default:
             break;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Area quests: spell Z-E-L-D-A, clear gaps, land a big combo. Available in every outdoor area of Hyrule.
+// Progress is stored in the settings file (shipofharkinian.json), so it's shared between save files.
+// ---------------------------------------------------------------------------------------------------------------------
+
+enum QuestBits { QUEST_LETTERS = 1 << 0, QUEST_GAPS = 1 << 1, QUEST_COMBO = 1 << 2, QUEST_ALL = 7 };
+
+static constexpr s32 kLetterCount = 5;
+static const char* const kLetterChars[kLetterCount] = { "Z", "E", "L", "D", "A" };
+static const char* const kLetterTag = "skate_letter";
+
+struct QuestLetter {
+    Vec3f pos;
+    bool collected;
+    Actor tagAnchor; // stand-in actor so SoH's name tag system can float the letter above the rupee
+};
+
+static QuestLetter sLetters[kLetterCount];
+static bool sLettersReady = false;
+static bool sGoalsShown = false; // the "GOALS" reminder shows once per visit to an area
+static u32 sQuestRng = 1;
+
+static bool IsQuestArea(s32 scene) {
+    return scene >= SCENE_HYRULE_FIELD && scene <= SCENE_LON_LON_RANCH;
+}
+
+static std::string QuestKey(const char* what, s32 scene) {
+    return std::string(CVAR_SKATE("Quest.")) + what + "." + std::to_string(scene);
+}
+
+static s32 QuestDone(s32 scene) {
+    return CVarGetInteger(QuestKey("Done", scene).c_str(), 0);
+}
+
+static s32 LettersMask(s32 scene) {
+    return CVarGetInteger(QuestKey("Letters", scene).c_str(), 0);
+}
+
+struct StoredGap {
+    s32 x1, z1, x2, z2;
+};
+
+static std::vector<StoredGap> LoadGaps(s32 scene) {
+    std::vector<StoredGap> gaps;
+    std::string data = CVarGetString(QuestKey("Gaps", scene).c_str(), "");
+    size_t start = 0;
+    while (start < data.size()) {
+        size_t end = data.find(';', start);
+        if (end == std::string::npos) {
+            end = data.size();
+        }
+        std::string entry = data.substr(start, end - start);
+        s32 v[4] = { 0, 0, 0, 0 };
+        s32 n = 0;
+        size_t p = 0;
+        while (n < 4 && p <= entry.size()) {
+            size_t comma = entry.find(',', p);
+            if (comma == std::string::npos) {
+                comma = entry.size();
+            }
+            if (comma > p) {
+                v[n++] = (s32)std::strtol(entry.substr(p, comma - p).c_str(), nullptr, 10);
+            }
+            p = comma + 1;
+        }
+        if (n == 4) {
+            gaps.push_back({ v[0], v[1], v[2], v[3] });
+        }
+        start = end + 1;
+    }
+    return gaps;
+}
+
+static void SaveGaps(s32 scene, const std::vector<StoredGap>& gaps) {
+    std::string data;
+    for (const StoredGap& g : gaps) {
+        data += std::to_string(g.x1) + "," + std::to_string(g.z1) + "," + std::to_string(g.x2) + "," +
+                std::to_string(g.z2) + ";";
+    }
+    CVarSetString(QuestKey("Gaps", scene).c_str(), data.c_str());
+    SaveCVars();
+}
+
+static std::string UpperCase(std::string text) {
+    for (char& c : text) {
+        if (c >= 'a' && c <= 'z') {
+            c = (char)(c - 'a' + 'A');
+        }
+    }
+    return text;
+}
+
+static void CompleteQuest(s32 scene, s32 bit, const char* name) {
+    s32 done = QuestDone(scene);
+    if (done & bit) {
+        return;
+    }
+    done |= bit;
+    CVarSetInteger(QuestKey("Done", scene).c_str(), done);
+    SaveCVars();
+
+    ShowMsg(std::string("QUEST COMPLETE: ") + name, MSG_GOOD, 70);
+    Sfx_PlaySfxCentered(NA_SE_SY_CORRECT_CHIME);
+    if (Cfg_QuestRupees()) {
+        Rupees_ChangeBy(20);
+    }
+    if (done == QUEST_ALL) {
+        ShowMsg(UpperCase(SohUtils::GetSceneName(scene)) + " MASTERED!", MSG_GOOD, 90);
+        Sfx_PlaySfxCentered(NA_SE_SY_GET_ITEM);
+        if (Cfg_QuestRupees()) {
+            Rupees_ChangeBy(50);
+        }
+    }
+}
+
+// Remembers a gap by where it starts and lands. Returns true the first time a gap is cleared.
+static bool RegisterGap(s32 scene, const Vec3f& from, const Vec3f& to) {
+    std::vector<StoredGap> gaps = LoadGaps(scene);
+    for (const StoredGap& g : gaps) {
+        f32 d1 = sqrtf(SQ((f32)g.x1 - from.x) + SQ((f32)g.z1 - from.z));
+        f32 d2 = sqrtf(SQ((f32)g.x2 - to.x) + SQ((f32)g.z2 - to.z));
+        if (d1 < 250.0f && d2 < 250.0f) {
+            return false;
+        }
+    }
+    gaps.push_back({ (s32)from.x, (s32)from.z, (s32)to.x, (s32)to.z });
+    SaveGaps(scene, gaps);
+    return true;
+}
+
+static f32 QuestRand() {
+    sQuestRng = sQuestRng * 1664525u + 1013904223u;
+    return (f32)(sQuestRng >> 8) / 16777216.0f;
+}
+
+static void LetterTagDraw(Actor*, PlayState*) {
+}
+
+static void ClearLetters() {
+    NameTag_RemoveAllByTag(kLetterTag);
+    sLettersReady = false;
+}
+
+// Scatters the five letters around wherever Link entered the area: on reachable ground, some floating at ollie
+// height, some out on the water when water skating is on. Each way into an area gets its own layout, but a letter
+// you've collected stays collected for that area.
+static void PlaceLetters(PlayState* play, Player* player) {
+    f32 age = AgeScale();
+    Vec3f anchor = player->actor.world.pos;
+    f32 anchorFloor = player->actor.floorHeight;
+    f32 maxRadius = (play->sceneNum == SCENE_HYRULE_FIELD) ? 2400.0f : 1300.0f;
+    s32 mask = LettersMask(play->sceneNum);
+
+    sQuestRng = (u32)(play->sceneNum * 7919 + gSaveContext.entranceIndex * 104729 + 12345);
+
+    Vec3f spots[kLetterCount];
+    s32 placed = 0;
+    for (s32 pass = 0; pass < 3 && placed < kLetterCount; pass++) {
+        // Each pass is less picky, so even cramped areas end up with all five letters
+        f32 heightRange = 260.0f + (f32)pass * 200.0f;
+        f32 spacing = 350.0f - (f32)pass * 120.0f;
+        f32 radius = maxRadius - (f32)pass * 300.0f;
+        for (s32 tries = 0; tries < 400 && placed < kLetterCount; tries++) {
+            f32 angle = QuestRand() * 2.0f * kPi;
+            f32 r = 200.0f + QuestRand() * (radius - 200.0f);
+            f32 x = anchor.x + sinf(angle) * r;
+            f32 z = anchor.z + cosf(angle) * r;
+
+            Vec3f probe = { x, anchorFloor + heightRange, z };
+            CollisionPoly* poly = NULL;
+            s32 bgId;
+            f32 y = BgCheck_EntityRaycastFloor3(&play->colCtx, &poly, &bgId, &probe);
+            if (poly == NULL || y < anchorFloor - heightRange || COLPOLY_GET_NORMAL(poly->normal.y) < 0.75f) {
+                continue;
+            }
+
+            f32 waterY = y;
+            WaterBox* waterBox;
+            if (WaterBox_GetSurface1(play, &play->colCtx, x, z, &waterY, &waterBox) && waterY > y + 1.0f) {
+                if (!Cfg_WaterSkate()) {
+                    continue;
+                }
+                y = waterY;
+            }
+
+            bool tooClose = false;
+            for (s32 i = 0; i < placed; i++) {
+                if (sqrtf(SQ(spots[i].x - x) + SQ(spots[i].z - z)) < spacing) {
+                    tooClose = true;
+                    break;
+                }
+            }
+            if (tooClose) {
+                continue;
+            }
+
+            f32 lift = (QuestRand() < 0.4f) ? 55.0f : 25.0f; // the high ones need an ollie
+            spots[placed++] = { x, y + lift * age, z };
+        }
+    }
+    // Last resort: line them up in front of Link
+    while (placed < kLetterCount) {
+        f32 r = 150.0f + (f32)placed * 120.0f;
+        s16 yaw = player->actor.shape.rot.y;
+        spots[placed] = { anchor.x + Math_SinS(yaw) * r, anchorFloor + 25.0f * age, anchor.z + Math_CosS(yaw) * r };
+        placed++;
+    }
+
+    // Spell it out as you go: Z is the closest, A the farthest
+    std::sort(spots, spots + kLetterCount, [&](const Vec3f& a, const Vec3f& b) {
+        return SQ(a.x - anchor.x) + SQ(a.z - anchor.z) < SQ(b.x - anchor.x) + SQ(b.z - anchor.z);
+    });
+
+    NameTag_RemoveAllByTag(kLetterTag);
+    for (s32 i = 0; i < kLetterCount; i++) {
+        QuestLetter& letter = sLetters[i];
+        letter.pos = spots[i];
+        letter.collected = (mask & (1 << i)) != 0;
+        memset(&letter.tagAnchor, 0, sizeof(Actor));
+        letter.tagAnchor.draw = LetterTagDraw;
+        letter.tagAnchor.isDrawn = true;
+        letter.tagAnchor.world.pos = letter.pos;
+        letter.tagAnchor.xyzDistToPlayerSq = 0.0f;
+        if (!letter.collected) {
+            NameTagOptions options = {};
+            options.tag = kLetterTag;
+            options.yOffset = 8;
+            options.textColor = { 255, 215, 60, 255 };
+            options.noZBuffer = true;
+            NameTag_RegisterForActorWithOptions(&letter.tagAnchor, kLetterChars[i], options);
+        }
+    }
+    sLettersReady = true;
+}
+
+static std::string LettersProgressText(s32 mask) {
+    std::string text;
+    for (s32 i = 0; i < kLetterCount; i++) {
+        text += (mask & (1 << i)) ? kLetterChars[i] : "_";
+        if (i < kLetterCount - 1) {
+            text += " ";
+        }
+    }
+    return text;
+}
+
+static void CollectLetter(PlayState* play, Player* player, s32 index);
+
+static void UpdateLetters(PlayState* play, Player* player, bool riding) {
+    if (!sLettersReady) {
+        return;
+    }
+    f32 age = AgeScale();
+    for (s32 i = 0; i < kLetterCount; i++) {
+        QuestLetter& letter = sLetters[i];
+        if (letter.collected) {
+            continue;
+        }
+        f32 dx = letter.pos.x - player->actor.world.pos.x;
+        f32 dz = letter.pos.z - player->actor.world.pos.z;
+        f32 dy = letter.pos.y - (player->actor.world.pos.y + 20.0f * age);
+        letter.tagAnchor.xyzDistToPlayerSq = SQ(dx) + SQ(dz) + SQ(dy);
+        if (riding && SQ(dx) + SQ(dz) < SQ(40.0f * age) && std::fabs(dy) < 45.0f * age) {
+            CollectLetter(play, player, i);
+        }
+    }
+}
+
+static void CollectLetter(PlayState* play, Player* player, s32 index) {
+    QuestLetter& letter = sLetters[index];
+    letter.collected = true;
+    NameTag_RemoveAllForActor(&letter.tagAnchor);
+
+    s32 scene = play->sceneNum;
+    s32 mask = LettersMask(scene) | (1 << index);
+    CVarSetInteger(QuestKey("Letters", scene).c_str(), mask);
+    SaveCVars();
+
+    sSkate.combo.Add(std::string("LETTER ") + kLetterChars[index], 100);
+    Sfx_PlaySfxCentered(NA_SE_SY_GET_RUPY);
+    ShowMsg(LettersProgressText(mask), MSG_INFO, 35);
+
+    static Color_RGBA8 sPrim = { 255, 255, 180, 255 };
+    static Color_RGBA8 sEnv = { 255, 200, 0, 255 };
+    for (s32 i = 0; i < 6; i++) {
+        Vec3f vel = { Rand_CenteredFloat(4.0f), 2.0f + Rand_ZeroOne() * 3.0f, Rand_CenteredFloat(4.0f) };
+        Vec3f accel = { 0.0f, -0.3f, 0.0f };
+        EffectSsKiraKira_SpawnSmall(play, &letter.pos, &vel, &accel, &sPrim, &sEnv);
+    }
+
+    if (mask == (1 << kLetterCount) - 1) {
+        CompleteQuest(scene, QUEST_LETTERS, "Z-E-L-D-A");
+    }
+    (void)player;
+}
+
+static void DrawLetters(PlayState* play) {
+    if (!sLettersReady) {
+        return;
+    }
+    for (s32 i = 0; i < kLetterCount; i++) {
+        QuestLetter& letter = sLetters[i];
+        if (letter.collected) {
+            continue;
+        }
+        Vec3f pos = letter.pos;
+        pos.y += 3.0f * Math_SinS((s16)(play->gameplayFrames * 0x400 + i * 0x3000)); // gentle bob
+        DrawItemAt(play, &letter, pos, GID_RUPEE_GOLD, 0.45f * AgeScale(), (s16)(play->gameplayFrames * 0x300));
+    }
+}
+
+// Where's the next letter? "AHEAD 320", "LEFT 150"... relative to the direction you're rolling
+static std::string NextLetterHint(Player* player) {
+    s32 best = -1;
+    f32 bestDist = 0.0f;
+    for (s32 i = 0; i < kLetterCount; i++) {
+        if (sLetters[i].collected) {
+            continue;
+        }
+        f32 d = Math_Vec3f_DistXZ(&player->actor.world.pos, &sLetters[i].pos);
+        if (best < 0 || d < bestDist) {
+            best = i;
+            bestDist = d;
+        }
+    }
+    if (best < 0) {
+        return "";
+    }
+    s16 rel = (s16)(Math_Vec3f_Yaw(&player->actor.world.pos, &sLetters[best].pos) - sSkate.moveYaw);
+    const char* dir = "AHEAD";
+    if (ABS(rel) > 0x6000) {
+        dir = "BEHIND";
+    } else if (rel > 0x1800) {
+        dir = "LEFT";
+    } else if (rel < -0x1800) {
+        dir = "RIGHT";
+    }
+    return std::string(kLetterChars[best]) + " " + dir + " " + std::to_string((s32)bestDist);
+}
+
+static std::string QuestHudLine(s32 scene) {
+    s32 done = QuestDone(scene);
+    s32 gaps = (s32)LoadGaps(scene).size();
+    std::string text = LettersProgressText(LettersMask(scene));
+    text += "  GAPS " + std::to_string(std::min(gaps, Tune::kQuestGapGoal)) + "/" + std::to_string(Tune::kQuestGapGoal);
+    text += (done & QUEST_COMBO) ? "  5K OK" : "  5K -";
+    return text;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -537,13 +1015,17 @@ static void BankCombo() {
     std::string text = "+" + std::to_string(total);
     if (total > CVarGetInteger(CVAR_SKATE("BestCombo"), 0)) {
         CVarSetInteger(CVAR_SKATE("BestCombo"), total);
-        Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
+        SaveCVars();
         text += "  NEW BEST!";
         Sfx_PlaySfxCentered(NA_SE_SY_GET_RUPY);
     } else if (total >= 1000) {
         Sfx_PlaySfxCentered(NA_SE_SY_CORRECT_CHIME);
     }
     ShowMsg(text, MSG_GOOD, 50);
+
+    if (Cfg_Quests() && gPlayState != nullptr && IsQuestArea(gPlayState->sceneNum) && total >= Tune::kQuestComboGoal) {
+        CompleteQuest(gPlayState->sceneNum, QUEST_COMBO, "5000 COMBO");
+    }
 
     if (Cfg_RupeeReward() && total >= 1000) {
         Rupees_ChangeBy((s16)std::min(total / 1000, 50));
@@ -588,6 +1070,270 @@ static void FinishGrind() {
 // Mount / dismount / bail
 // ---------------------------------------------------------------------------------------------------------------------
 
+static void StartAir(Player* player, f32 launchVelY);
+
+// ---- Gaps -----------------------------------------------------------------------------------------------------------
+
+// Called when a jump ends (landing, or locking onto a rail). Decides whether it cleared a gap.
+static void CheckGap(PlayState* play, Player* player, bool toRail) {
+    if (!sSkate.airTracking) {
+        return;
+    }
+    sSkate.airTracking = false;
+
+    f32 age = AgeScale();
+    Vec3f land = player->actor.world.pos;
+    f32 dist = Math_Vec3f_DistXZ(&sSkate.takeoffPos, &land);
+    f32 low = std::min(sSkate.takeoffPos.y, land.y);
+    f32 depth = low - sSkate.airLowestFloor;
+    f32 rise = land.y - sSkate.takeoffPos.y;
+    bool overWater = sSkate.airOverWater && !sSkate.onWater;
+
+    const char* type = nullptr;
+    if (sSkate.fromGrind && toRail && dist > 100.0f * age) {
+        type = "RAIL TRANSFER";
+    } else if (dist >= 180.0f * age && (depth >= 80.0f * age || overWater)) {
+        if (toRail) {
+            type = "GAP TO RAIL";
+        } else if (overWater) {
+            type = "WATER GAP";
+        } else if (rise > 40.0f * age) {
+            type = "STEP UP GAP";
+        } else {
+            type = "CANYON GAP";
+        }
+    } else if (rise < -250.0f * age) {
+        type = "BIG DROP";
+    }
+    if (type == nullptr) {
+        return;
+    }
+
+    s32 points = 250 + (s32)(dist * 0.5f) + (s32)std::max(0.0f, depth * 0.5f);
+    if (Cfg_Quests() && IsQuestArea(play->sceneNum) && RegisterGap(play->sceneNum, sSkate.takeoffPos, land)) {
+        points *= 2;
+        ShowMsg(std::string("NEW GAP! ") + type, MSG_GOOD, 45);
+        Sfx_PlaySfxCentered(NA_SE_SY_TRE_BOX_APPEAR);
+        if ((s32)LoadGaps(play->sceneNum).size() >= Tune::kQuestGapGoal) {
+            CompleteQuest(play->sceneNum, QUEST_GAPS, "3 GAPS");
+        }
+    }
+    sSkate.combo.Add(type, points);
+}
+
+// ---- Epona tow ------------------------------------------------------------------------------------------------------
+
+// Adult Epona, standing around (called with Epona's Song), close enough to grab
+static EnHorse* FindEpona(PlayState* play, Player* player) {
+    for (Actor* actor = play->actorCtx.actorLists[ACTORCAT_BG].head; actor != NULL; actor = actor->next) {
+        if (actor->id != ACTOR_EN_HORSE || actor->update == NULL) {
+            continue;
+        }
+        EnHorse* horse = (EnHorse*)actor;
+        if (horse->type != HORSE_EPONA || (horse->stateFlags & ENHORSE_INACTIVE)) {
+            continue;
+        }
+        if (horse->action != ENHORSE_ACT_IDLE && horse->action != ENHORSE_ACT_FOLLOW_PLAYER) {
+            continue;
+        }
+        if (Actor_WorldDistXZToActor(&player->actor, actor) < Tune::kTowGrabRange) {
+            return horse;
+        }
+    }
+    return nullptr;
+}
+
+static void SetTowHeading(EnHorse* horse, s16 yaw) {
+    // Epona's "run away" behaviour gallops toward her home point, so we keep moving that point ahead of her
+    horse->actor.home.pos.x = horse->actor.world.pos.x + Math_SinS(yaw) * 1000.0f;
+    horse->actor.home.pos.y = horse->actor.world.pos.y;
+    horse->actor.home.pos.z = horse->actor.world.pos.z + Math_CosS(yaw) * 1000.0f;
+}
+
+static void StartTow(PlayState* play, Player* player, EnHorse* horse) {
+    sSkate.towHorse = horse;
+    sSkate.towFrames = 0;
+    sSkate.pushTimer = 0;
+    EnHorse_InitFleePlayer(horse);
+    horse->actor.world.rot.y = horse->actor.shape.rot.y = sSkate.moveYaw;
+    SetTowHeading(horse, sSkate.moveYaw);
+    Audio_PlaySfxGeneral(NA_SE_EV_HORSE_NEIGH, &horse->actor.projectedPos, 4, &gSfxDefaultFreqAndVolScale,
+                         &gSfxDefaultFreqAndVolScale, &gSfxDefaultReverb);
+    ShowMsg("HANG ON!", MSG_INFO, 30);
+    sSkate.anim = ANIM_NONE;
+    SetAnim(play, player, ANIM_TOW);
+}
+
+static void EndTow(PlayState* play, bool slingshot) {
+    EnHorse* horse = sSkate.towHorse;
+    sSkate.towHorse = nullptr;
+    sSkate.anim = ANIM_NONE;
+    if (horse != nullptr && IsActorAlive(play, &horse->actor, ACTORCAT_BG)) {
+        horse->actor.home.pos = horse->actor.world.pos;
+        EnHorse_StartIdleRidable(horse);
+    }
+    if (slingshot && sSkate.towFrames > 15) {
+        sSkate.speed = std::min(sSkate.speed + Tune::kTowSlingshot, Tune::kMaxSpeed * 1.3f);
+        sSkate.combo.Add("EPONA TOW", 100 + std::min(sSkate.towFrames, 200) * 5);
+        ShowMsg("SLINGSHOT!", MSG_GOOD, 30);
+    }
+    sSkate.towFrames = 0;
+}
+
+// Returns true while towing (Epona sets the speed and direction instead of the player)
+static bool UpdateTow(PlayState* play, Player* player, Input* input) {
+    EnHorse* horse = sSkate.towHorse;
+    if (horse == nullptr) {
+        return false;
+    }
+    if (!IsActorAlive(play, &horse->actor, ACTORCAT_BG) || horse->action != ENHORSE_ACT_FLEE_PLAYER) {
+        sSkate.towHorse = nullptr;
+        sSkate.anim = ANIM_NONE;
+        return false;
+    }
+    if (!CHECK_BTN_ALL(input->cur.button, BTN_R)) {
+        EndTow(play, true);
+        return false;
+    }
+
+    // Steer Epona with the stick
+    f32 sx = StickX(input);
+    SetTowHeading(horse, (s16)(horse->actor.world.rot.y - (s16)(sx * 0x2800)));
+
+    // Hang on behind her
+    Vec3f target = horse->actor.world.pos;
+    target.x -= Math_SinS(horse->actor.shape.rot.y) * Tune::kTowDistance;
+    target.z -= Math_CosS(horse->actor.shape.rot.y) * Tune::kTowDistance;
+    f32 dist = Math_Vec3f_DistXZ(&player->actor.world.pos, &target);
+    if (dist > Tune::kTowLoseGrip) {
+        EndTow(play, false);
+        ShowMsg("LOST GRIP", MSG_BAD, 30);
+        return false;
+    }
+    if (dist > 2.0f) {
+        Math_ScaledStepToS(&sSkate.moveYaw, Math_Vec3f_Yaw(&player->actor.world.pos, &target), 0x1800);
+    }
+    sSkate.speed = std::clamp(horse->actor.speedXZ + dist * 0.3f, 0.0f, 18.0f);
+    sSkate.towFrames++;
+
+    if (sSkate.phase == PHASE_GROUND) {
+        SetAnim(play, player, ANIM_TOW);
+        if (Cfg_RollSound() && sSkate.speed > 1.5f && !sSkate.onWater) {
+            PlayLoopSfx(player, NA_SE_PL_SLIP_LEVEL, 0.7f + sSkate.speed * 0.03f,
+                        std::min(0.25f + sSkate.speed * 0.04f, 0.8f));
+        }
+    }
+    return true;
+}
+
+// ---- Bomb hop -------------------------------------------------------------------------------------------------------
+
+static s32 BombButtonMask() {
+    static const u16 sButtons[] = {
+        BTN_B, BTN_CLEFT, BTN_CDOWN, BTN_CRIGHT, BTN_DUP, BTN_DDOWN, BTN_DLEFT, BTN_DRIGHT
+    };
+    for (s32 i = 1; i < 8; i++) {
+        if (gSaveContext.equips.buttonItems[i] == ITEM_BOMB) {
+            return sButtons[i];
+        }
+    }
+    return BTN_Z; // bombs aren't on a button: use Z
+}
+
+static void DropBomb(Player* player) {
+    if (sSkate.bombActive) {
+        return;
+    }
+    if (!Cfg_FreeBombs()) {
+        if (INV_CONTENT(ITEM_BOMB) != ITEM_BOMB || AMMO(ITEM_BOMB) <= 0) {
+            ShowMsg("NO BOMBS", MSG_BAD, 25);
+            Sfx_PlaySfxCentered(NA_SE_SY_ERROR);
+            return;
+        }
+        Inventory_ChangeAmmo(ITEM_BOMB, -1);
+    }
+    sSkate.bombActive = true;
+    sSkate.bombTimer = Tune::kBombFuse;
+    sSkate.bombPos = player->actor.world.pos;
+    sSkate.bombPos.x -= Math_SinS(sSkate.moveYaw) * 8.0f;
+    sSkate.bombPos.z -= Math_CosS(sSkate.moveYaw) * 8.0f;
+    sSkate.bombVelY = (sSkate.phase == PHASE_AIR) ? std::min(0.0f, player->actor.velocity.y) - 2.0f : 0.0f;
+    PlaySfx(player, NA_SE_IT_BOMB_IGNIT);
+}
+
+static void ExitGrindToAir(Player* player, f32 hop);
+
+static void ExplodeBomb(PlayState* play, Player* player, bool riding) {
+    sSkate.bombActive = false;
+
+    Vec3f zero = { 0.0f, 0.0f, 0.0f };
+    Vec3f effPos = sSkate.bombPos;
+    effPos.y += 10.0f;
+    EffectSsBomb2_SpawnLayered(play, &effPos, &zero, &zero, 100, 19);
+    Vec3f groundPos = sSkate.bombPos;
+    EffectSsBlast_SpawnWhiteShockwave(play, &groundPos, &zero, &zero);
+    PlaySfx(player, NA_SE_IT_BOMB_EXPLOSION);
+
+    f32 dist = Math_Vec3f_DistXYZ(&player->actor.world.pos, &sSkate.bombPos);
+    Rumble_Request(dist, 0xFF, 0x14, 0x96);
+    s16 quake = Quake_Add(GET_ACTIVE_CAM(play), 3);
+    Quake_SetSpeed(quake, 25000);
+    Quake_SetQuakeValues(quake, 3, 0, 0, 0);
+    Quake_SetCountdown(quake, 6);
+
+    f32 radius = Tune::kBombRadius * AgeScale();
+    if (!riding || dist > radius) {
+        return;
+    }
+    // The closer you are, the bigger the blast-off
+    f32 strength = 1.0f - 0.5f * (dist / radius);
+    f32 launch = Tune::kBombLaunchY * strength * sqrtf(AgeScale());
+    if (sSkate.phase == PHASE_GRIND) {
+        ExitGrindToAir(player, launch);
+    } else if (sSkate.phase == PHASE_GROUND) {
+        StartAir(player, launch);
+    } else {
+        player->actor.velocity.y = std::max(player->actor.velocity.y, launch);
+    }
+    sSkate.speed = std::min(sSkate.speed + Tune::kBombBoost * strength, Tune::kMaxSpeed * 1.3f);
+    sSkate.combo.Add("BOMB HOP", 300);
+    sSkate.anim = ANIM_NONE;
+    SetAnim(play, player, ANIM_AIR_UP);
+}
+
+static void UpdateBomb(PlayState* play, Player* player, bool riding) {
+    if (!sSkate.bombActive) {
+        return;
+    }
+    // Fall until it hits the floor (or bobs on water)
+    sSkate.bombVelY = std::max(sSkate.bombVelY - 1.5f, -20.0f);
+    sSkate.bombPos.y += sSkate.bombVelY;
+    f32 floorY = FloorAt(play, sSkate.bombPos.x, sSkate.bombPos.y + 30.0f, sSkate.bombPos.z);
+    f32 waterY = sSkate.bombPos.y + 30.0f;
+    WaterBox* waterBox;
+    if (WaterBox_GetSurface1(play, &play->colCtx, sSkate.bombPos.x, sSkate.bombPos.z, &waterY, &waterBox) &&
+        waterY > floorY) {
+        floorY = waterY;
+    }
+    if (floorY > BGCHECK_Y_MIN && sSkate.bombPos.y < floorY) {
+        sSkate.bombPos.y = floorY;
+        sSkate.bombVelY = 0.0f;
+    }
+
+    // Fuse sparks
+    static Color_RGBA8 sPrim = { 255, 255, 150, 255 };
+    static Color_RGBA8 sEnv = { 255, 100, 0, 255 };
+    Vec3f spark = sSkate.bombPos;
+    spark.y += 14.0f;
+    Vec3f vel = { Rand_CenteredFloat(1.5f), 1.0f, Rand_CenteredFloat(1.5f) };
+    Vec3f accel = { 0.0f, -0.2f, 0.0f };
+    EffectSsKiraKira_SpawnSmall(play, &spark, &vel, &accel, &sPrim, &sEnv);
+
+    if (--sSkate.bombTimer <= 0) {
+        ExplodeBomb(play, player, riding);
+    }
+}
+
 static void ResetVisuals(Player* player) {
     player->actor.shape.yOffset = 0.0f;
     player->actor.shape.rot.x = 0;
@@ -609,6 +1355,11 @@ static void ClearRideState() {
     sSkate.anim = ANIM_NONE;
     sSkate.pushTimer = 0;
     sSkate.pushBlend = 0.0f;
+    if (sSkate.towHorse != nullptr && gPlayState != nullptr) {
+        EndTow(gPlayState, false);
+    }
+    sSkate.towHorse = nullptr;
+    sSkate.airTracking = false;
 }
 
 static void Dismount(PlayState* play, Player* player) {
@@ -650,8 +1401,19 @@ static void Skate_AfterPutAway(PlayState* play, Player* player) {
     sSkate.flipIdx = -1;
     sSkate.grabIdx = -1;
     sSkate.noGrindTimer = 0;
-    sSkate.combo.Clear();
-    sSkate.session = 0;
+    if (sSkate.carryActive) {
+        // Rolled in from the previous area: keep the speed, the combo and the session score
+        sSkate.speed = sSkate.carrySpeed;
+        sSkate.carryPending = sSkate.carryActive = false;
+    } else {
+        sSkate.carryPending = false;
+        sSkate.combo.Clear();
+        sSkate.session = 0;
+        if (Cfg_Quests() && IsQuestArea(play->sceneNum) && QuestDone(play->sceneNum) != QUEST_ALL && !sGoalsShown) {
+            sGoalsShown = true;
+            ShowMsg("GOALS: SPELL ZELDA, 3 GAPS, 5000 COMBO", MSG_INFO, 70);
+        }
+    }
     player->stateFlags3 |= PLAYER_STATE3_MIDAIR;
 
     SetAnim(play, player, ANIM_RIDE);
@@ -696,16 +1458,26 @@ static void StartAir(Player* player, f32 launchVelY) {
     sSkate.flipTimer = 0;
     sSkate.grabIdx = -1;
     sSkate.grabFrames = 0;
+    sSkate.wallJumps = 0;
+    sSkate.aBuffer = 0;
     if (launchVelY > player->actor.velocity.y) {
         player->actor.velocity.y = launchVelY;
     }
+    // Gap tracking: remember where we took off and watch what we fly over
+    sSkate.airTracking = true;
+    sSkate.fromGrind = false;
+    sSkate.airOverWater = false;
+    sSkate.takeoffPos = player->actor.world.pos;
+    sSkate.airLowestFloor = player->actor.world.pos.y;
 }
 
 static void StartGrind(PlayState* play, Player* player, Input* input, const Vec3f& pos, s16 yaw) {
     if (sSkate.phase == PHASE_AIR) {
         FinishGrab();
         FinalizeSpin();
+        CheckGap(play, player, true);
     }
+    sSkate.airTracking = false;
     sSkate.phase = PHASE_GRIND;
     sSkate.pushTimer = 0;
     sSkate.grindIdx = GetStickDir(input);
@@ -730,6 +1502,7 @@ static void StartGrind(PlayState* play, Player* player, Input* input, const Vec3
 static void ExitGrindToAir(Player* player, f32 hop) {
     FinishGrind();
     StartAir(player, hop);
+    sSkate.fromGrind = true;
     sSkate.noGrindTimer = 8;
 }
 
@@ -823,6 +1596,15 @@ static void UpdateGround(PlayState* play, Player* player, Input* input) {
         return;
     }
 
+    // Grab Epona: press R next to her (takes priority over grinding)
+    if (CHECK_BTN_ALL(input->press.button, BTN_R) && sSkate.towHorse == nullptr) {
+        EnHorse* horse = FindEpona(play, player);
+        if (horse != nullptr) {
+            StartTow(play, player, horse);
+            return;
+        }
+    }
+
     // Grind from the ground: press R while rolling along a ledge
     if (CHECK_BTN_ALL(input->press.button, BTN_R) && sSkate.speed > Tune::kGrindMinSpeed) {
         Vec3f pos;
@@ -908,6 +1690,7 @@ static void Land(PlayState* play, Player* player) {
     }
 
     FinalizeSpin();
+    CheckGap(play, player, false);
     BankCombo();
 
     sSkate.phase = PHASE_GROUND;
@@ -932,6 +1715,47 @@ static void Land(PlayState* play, Player* player) {
 static void UpdateAir(PlayState* play, Player* player, Input* input) {
     f32 sx = StickX(input);
     StickDir dir = GetStickDir(input);
+
+    // Gap tracking: the deepest floor and any water we pass over
+    if (sSkate.airTracking) {
+        f32 floorY = player->actor.floorHeight;
+        if (floorY <= BGCHECK_Y_MIN + 1.0f) {
+            floorY = player->actor.world.pos.y - 2000.0f; // nothing below at all
+        }
+        sSkate.airLowestFloor = std::min(sSkate.airLowestFloor, floorY);
+        f32 waterY;
+        if (GetWaterSurface(play, player, &waterY) && waterY < player->actor.world.pos.y) {
+            sSkate.airOverWater = true;
+        }
+    }
+
+    // Wall jump: press A as you hit a wall (a few frames early is fine)
+    if (CHECK_BTN_ALL(input->press.button, BTN_A)) {
+        sSkate.aBuffer = Tune::kWallJumpBuffer;
+    } else if (sSkate.aBuffer > 0) {
+        sSkate.aBuffer--;
+    }
+    if (Cfg_WallJumps() && sSkate.aBuffer > 0 && sSkate.wallJumps < Tune::kWallJumpMax &&
+        (player->actor.bgCheckFlags & BGCHECKFLAG_WALL)) {
+        s16 into = (s16)(player->actor.wallYaw - (s16)(sSkate.moveYaw + 0x8000));
+        if (ABS(into) < 0x3800) {
+            // Bounce off: mirror the direction of travel around the wall
+            sSkate.moveYaw = (s16)(2 * player->actor.wallYaw - sSkate.moveYaw + 0x8000);
+            sSkate.speed = std::max(sSkate.impactSpeed * 0.9f, 5.0f);
+            player->actor.velocity.y = Tune::kWallJumpVelY * sqrtf(AgeScale());
+            sSkate.wallJumps++;
+            sSkate.aBuffer = 0;
+            sSkate.noGrindTimer = 4;
+            sSkate.combo.Add("WALLPLANT", 250);
+            PlaySfx(player, NA_SE_IT_SHIELD_BOUND);
+            Player_PlayVoiceSfx(player, NA_SE_VO_LI_AUTO_JUMP);
+            Vec3f wallPos = player->actor.world.pos;
+            wallPos.y += 10.0f;
+            Actor_SpawnFloorDustRing(play, &player->actor, &wallPos, 6.0f, 3, 3.0f, 100, 15, false);
+            sSkate.anim = ANIM_NONE;
+            SetAnim(play, player, ANIM_AIR_UP);
+        }
+    }
 
     // Spin with the stick
     sSkate.spin += (s32)(-sx * Tune::kSpinRate);
@@ -1073,7 +1897,8 @@ static void UpdateGrind(PlayState* play, Player* player, Input* input) {
 static void UpdateVisuals(Player* player) {
     s16 stanceSign = (Cfg_Stance() == STANCE_GOOFY) ? -1 : 1;
     // Turn from sideways (riding stance) to facing forward while pushing, then back
-    Math_StepToF(&sSkate.pushBlend, (sSkate.pushTimer > 0 && sSkate.phase == PHASE_GROUND) ? 1.0f : 0.0f, 0.25f);
+    bool faceForward = (sSkate.pushTimer > 0 || sSkate.towHorse != nullptr) && sSkate.phase == PHASE_GROUND;
+    Math_StepToF(&sSkate.pushBlend, faceForward ? 1.0f : 0.0f, 0.25f);
     s16 stanceOffset = (s16)(stanceSign * 0x4000 + (sSkate.fakie ? 0x8000 : 0));
     s16 baseBody = (s16)(sSkate.moveYaw + (s16)(stanceOffset * (1.0f - sSkate.pushBlend)));
 
@@ -1115,8 +1940,8 @@ static void UpdateVisuals(Player* player) {
             break;
         }
         default:
-            // Lean into the push
-            targetTiltX = (s16)(0x0700 * sSkate.pushBlend);
+            // Lean into the push, or lean back while being towed
+            targetTiltX = (s16)((sSkate.towHorse != nullptr ? -0x0600 : 0x0700) * sSkate.pushBlend);
             break;
     }
 
@@ -1202,8 +2027,27 @@ void Skate_Action(Player* player, PlayState* play) {
         sSkate.speed = std::max(moved, sSkate.speed * 0.6f);
     }
 
+    // Bomb hop: drop a bomb with your Bombs button (or Z if bombs aren't equipped)
+    if (sSkate.phase != PHASE_GRIND && CHECK_BTN_ANY(input->press.button, BombButtonMask())) {
+        DropBomb(player);
+    }
+
+    // Towed by Epona: she sets our speed and direction, we still do everything else
+    bool towing = (sSkate.phase != PHASE_GRIND) && UpdateTow(play, player, input);
+    if (towing && sSkate.phase == PHASE_GROUND && CHECK_BTN_ALL(input->press.button, BTN_A)) {
+        // Let go with an ollie
+        EndTow(play, true);
+        towing = false;
+        StartAir(player, Tune::kOllieBase * sqrtf(AgeScale()));
+        PlaySfx(player, NA_SE_IT_SHIELD_BOUND);
+        SetAnim(play, player, ANIM_AIR_UP);
+    }
+
     switch (sSkate.phase) {
         case PHASE_GROUND:
+            if (towing && (grounded || nearFloor)) {
+                break; // just roll along behind her
+            }
             if (!grounded && (!nearFloor || sSkate.lastRise > 0.15f)) {
                 // Rolled off an edge or the top of a ramp: launch along the slope
                 f32 launch = std::max(0.0f, sSkate.lastRise) * sSkate.speed * Tune::kRampLaunch;
@@ -1384,6 +2228,17 @@ static void HudDraw(GfxPrint* printer) {
         }
     }
 
+    if (sSkate.active && Cfg_Quests() && gPlayState != nullptr && IsQuestArea(gPlayState->sceneNum)) {
+        s32 scene = gPlayState->sceneNum;
+        GfxPrint_SetColor(printer, QuestDone(scene) == QUEST_ALL ? 120 : 255, 230, 120, 255);
+        HudPrintCentered(printer, 25, QuestHudLine(scene));
+        if (sLettersReady && LettersMask(scene) != (1 << kLetterCount) - 1) {
+            Player* player = GET_PLAYER(gPlayState);
+            GfxPrint_SetColor(printer, 200, 200, 200, 255);
+            HudPrintCentered(printer, 26, "NEXT " + NextLetterHint(player));
+        }
+    }
+
     if (sSkate.msgTimer > 0) {
         switch (sSkate.msgColor) {
             case MSG_GOOD:
@@ -1433,6 +2288,14 @@ static void OnDrawEnd() {
         DrawBoard(gPlayState, player);
         player->actor.shape.rot = sSkate.logicRot; // back to the camera-friendly rotation
     }
+    if (Cfg_Quests()) {
+        DrawLetters(gPlayState);
+    }
+    if (sSkate.bombActive) {
+        // Swells up just before it goes off
+        f32 scale = 0.35f + ((sSkate.bombTimer < 4) ? (4 - sSkate.bombTimer) * 0.04f : 0.0f);
+        DrawItemAt(gPlayState, &sSkate.bombPos, sSkate.bombPos, GID_BOMB, scale, sSkate.moveYaw);
+    }
     if (Cfg_ShowHud() && (IsRiding(player) || sSkate.msgTimer > 0)) {
         DrawHud(gPlayState);
     }
@@ -1451,11 +2314,43 @@ static void OnPlayerUpdate() {
         return;
     }
 
-    if (sSkate.msgTimer > 0) {
-        sSkate.msgTimer--;
-    }
+    UpdateMessages();
     if (sSkate.toggleCooldown > 0) {
         sSkate.toggleCooldown--;
+    }
+    sSkate.sceneFrames++;
+
+    bool riding = sSkate.active && player->actionFunc == Skate_Action;
+
+    // Quests: place the letters once Link is standing in an outdoor area, then check for pickups
+    if (Cfg_Quests() && IsQuestArea(gPlayState->sceneNum)) {
+        if (!sLettersReady && sSkate.sceneFrames > 10 && (player->actor.bgCheckFlags & BGCHECKFLAG_GROUND) &&
+            player->actor.floorHeight > BGCHECK_Y_MIN) {
+            PlaceLetters(gPlayState, player);
+        }
+        UpdateLetters(gPlayState, player, riding);
+    } else if (sLettersReady) {
+        ClearLetters();
+    }
+
+    UpdateBomb(gPlayState, player, riding);
+
+    // Seamless loading zones: we rolled into a new area. Skip Link's walk-in and put him straight back on the board.
+    if (sSkate.carryPending && !sSkate.carryActive && ++sSkate.carryTimer > 30) {
+        sSkate.carryPending = false; // the area change never happened
+    }
+    if (sSkate.carryActive) {
+        if (sSkate.sceneFrames > 60) {
+            sSkate.carryPending = sSkate.carryActive = false;
+            sSkate.combo.Clear();
+        } else if (!sSkate.active && !sSkate.mountPending && sSkate.sceneFrames >= 3 &&
+                   player->actionFunc == Player_Action_80845CA4) {
+            func_8005B1A4(Play_GetCamera(gPlayState, 0));
+            func_80845C68(gPlayState, gSaveContext.respawn[RESPAWN_MODE_DOWN].data);
+            sSkate.remountPending = false;
+            TryMount(gPlayState, player);
+            return;
+        }
     }
 
     // Mount request was interrupted (hit while putting items away, etc.)
@@ -1468,13 +2363,27 @@ static void OnPlayerUpdate() {
     if (sSkate.active && player->actionFunc != Skate_Action) {
         bool leavingArea =
             gPlayState->transitionTrigger != TRANS_TRIGGER_OFF || (player->stateFlags1 & PLAYER_STATE1_LOADING);
+        bool keepCombo = false;
         if (leavingArea && Cfg_KeepBoard()) {
             sSkate.remountPending = true;
             sSkate.remountTimer = 100;
+            // Rode into a loading zone: swap the fade for an instant cut and carry our speed and combo across
+            if (Cfg_Seamless() && gPlayState->transitionTrigger == TRANS_TRIGGER_START &&
+                gSaveContext.respawnFlag == 0) {
+                gPlayState->transitionType = TRANS_TYPE_INSTANT;
+                gSaveContext.nextTransitionType = TRANS_TYPE_INSTANT;
+                sSkate.carryPending = true;
+                sSkate.carryActive = false;
+                sSkate.carryTimer = 0;
+                sSkate.carrySpeed = sSkate.speed;
+                keepCombo = true;
+            }
         } else if (!sSkate.bailPending && !sSkate.combo.Empty()) {
             ShowMsg("COMBO LOST", MSG_BAD, 30);
         }
-        sSkate.combo.Clear();
+        if (!keepCombo) {
+            sSkate.combo.Clear();
+        }
         ResetVisuals(player);
         ClearRideState();
     }
@@ -1505,10 +2414,19 @@ static void OnPlayerUpdate() {
 
 static void OnPlayDestroy() {
     bool wasRiding = sSkate.active || sSkate.mountPending;
+    sSkate.towHorse = nullptr; // the area's actors are going away; don't touch Epona
     ClearRideState();
     sSkate.mountPending = false;
-    sSkate.combo.Clear();
+    sSkate.carryActive = sSkate.carryPending;
+    if (!sSkate.carryPending) {
+        sSkate.combo.Clear();
+    }
     sSkate.msgTimer = 0;
+    sMsgQueue.clear();
+    sSkate.bombActive = false;
+    sSkate.sceneFrames = 0;
+    sGoalsShown = false;
+    ClearLetters();
     // Hop back on in the next area (loading zones, doors, voids)
     sSkate.remountPending = (sSkate.remountPending || wasRiding) && Cfg_KeepBoard();
     sSkate.remountTimer = 100;
@@ -1516,6 +2434,9 @@ static void OnPlayDestroy() {
 
 static void RegisterSkateboard() {
     bool enabled = SKATE_ENABLED;
+    if (!enabled) {
+        ClearLetters();
+    }
 
     // Grab the input the game is about to hand the player action (it is blanked during some transitions)
     COND_VB_SHOULD(VB_EXECUTE_PLAYER_ACTION_FUNC, enabled, {
@@ -1624,6 +2545,76 @@ static void RegisterSkateboardWidgets() {
         .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
             "Ride across lakes and rivers as long as you stay on the board.\n"
             "Step off or bail over deep water and Link falls in and swims."));
+
+    SohGui::mSohMenu->AddWidget(path, "Seamless Loading Zones", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_SKATE("SeamlessAreas"))
+        .PreFunc(disabledIfOff)
+        .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
+            "While on the board, loading zones between areas cut instantly instead of fading to black,\n"
+            "and you roll out the other side with the same speed and your combo still going."));
+
+    SohGui::mSohMenu->AddWidget(path, "Wall Jumps", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_SKATE("WallJumps"))
+        .PreFunc(disabledIfOff)
+        .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
+            "Press A as you hit a wall in the air to bounce off it (up to 3 times per jump)."));
+
+    SohGui::mSohMenu->AddWidget(path, "Free Bomb Hops", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_SKATE("FreeBombs"))
+        .PreFunc(disabledIfOff)
+        .Options(UIWidgets::CheckboxOptions().Tooltip(
+            "Bomb hops normally use a bomb from your Bomb Bag. Tick this to hop without bombs.\n"
+            "Drop a bomb with the button your Bombs are on (or Z if they aren't equipped)."));
+
+    SohGui::mSohMenu->AddWidget(path, "Area Quests", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_SKATE("Quests"))
+        .PreFunc(disabledIfOff)
+        .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
+            "Every outdoor area has three skate goals:\n"
+            "- Spell Z-E-L-D-A: collect the five golden letters (on the board)\n"
+            "- Clear 3 different gaps: jumps over pits, water, or from rail to rail\n"
+            "- Land a 5,000 point combo"));
+
+    SohGui::mSohMenu->AddWidget(path, "Quest Rupee Rewards", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_SKATE("QuestRupees"))
+        .PreFunc([](WidgetInfo& info) { info.options->disabled = !SKATE_ENABLED || !Cfg_Quests(); })
+        .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
+            "20 rupees per quest, plus 50 for finishing all three in an area."));
+
+    SohGui::mSohMenu->AddWidget(path, "Quest Log", WIDGET_TEXT).PreFunc([](WidgetInfo& info) {
+        info.isHidden = !SKATE_ENABLED || !Cfg_Quests();
+        std::string log = "Quest Log (letters / gaps / 5,000 combo):";
+        s32 mastered = 0;
+        for (s32 scene = SCENE_HYRULE_FIELD; scene <= SCENE_LON_LON_RANCH; scene++) {
+            s32 done = QuestDone(scene);
+            s32 letters = 0;
+            s32 mask = LettersMask(scene);
+            for (s32 i = 0; i < kLetterCount; i++) {
+                letters += (mask >> i) & 1;
+            }
+            s32 gaps = std::min((s32)LoadGaps(scene).size(), Tune::kQuestGapGoal);
+            if (done == QUEST_ALL) {
+                mastered++;
+            }
+            log += "\n" + SohUtils::GetSceneName(scene) + ": " + std::to_string(letters) + "/5, " +
+                   std::to_string(gaps) + "/3, " + ((done & QUEST_COMBO) ? "done" : "-") +
+                   (done == QUEST_ALL ? "  (mastered)" : "");
+        }
+        log += "\nAreas mastered: " + std::to_string(mastered) + "/19";
+        info.name = log;
+    });
+
+    SohGui::mSohMenu->AddWidget(path, "Reset Quest Progress", WIDGET_BUTTON)
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !SKATE_ENABLED || !Cfg_Quests(); })
+        .Callback([](WidgetInfo&) {
+            for (s32 scene = SCENE_HYRULE_FIELD; scene <= SCENE_LON_LON_RANCH; scene++) {
+                CVarClear(QuestKey("Done", scene).c_str());
+                CVarClear(QuestKey("Letters", scene).c_str());
+                CVarClear(QuestKey("Gaps", scene).c_str());
+            }
+            SaveCVars();
+            ClearLetters(); // they get placed again, uncollected
+        });
 
     SohGui::mSohMenu->AddWidget(path, "Show Trick HUD", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_SKATE("ShowHud"))
