@@ -1644,8 +1644,8 @@ static void PipkinActor_Update(Actor* thisx, PlayState* play) {
         p->squeakTimer--;
     }
 
-    bool near = thisx->xzDistToPlayer < 45.0f && fabsf(thisx->yDistToPlayer) < 30.0f;
-    s16 targetYaw = near ? thisx->yawTowardsPlayer : p->homeYaw;
+    bool linkClose = thisx->xzDistToPlayer < 45.0f && fabsf(thisx->yDistToPlayer) < 30.0f;
+    s16 targetYaw = linkClose ? thisx->yawTowardsPlayer : p->homeYaw;
     Math_SmoothStepToS(&thisx->shape.rot.y, targetYaw, 4, 0x800, 0x80);
     thisx->world.rot.y = thisx->shape.rot.y;
 
@@ -2769,7 +2769,7 @@ static void UpdateWarp(PlayState* play, Player* player) {
                 sLoc = LOC_HOLLOW;
                 sEnteredStump = sWarp.stump;
                 sSave.stumpFound |= static_cast<u8>(1 << sWarp.stump);
-                PlaceLink(play, World(Hollow::kArrive), static_cast<s16>(0x8000));
+                PlaceLink(play, World(Hollow::kArrive), static_cast<s16>(-0x8000));
                 Minish_SetTinyNow(player);
                 PlayAreaMusic(NA_BGM_KOKIRI);
                 break;
@@ -2787,7 +2787,7 @@ static void UpdateWarp(PlayState* play, Player* player) {
                     break;
                 }
                 sLoc = LOC_ROOTWORKS;
-                PlaceLink(play, World(Rootworks::kArrive), static_cast<s16>(0x8000));
+                PlaceLink(play, World(Rootworks::kArrive), static_cast<s16>(-0x8000));
                 PlayAreaMusic(NA_BGM_INSIDE_DEKU_TREE);
                 break;
             case W_RW_TO_HOLLOW:
